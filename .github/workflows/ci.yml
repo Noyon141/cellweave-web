@@ -1,0 +1,62 @@
+name: CellWeave Web CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  validate:
+    name: Lint, Typecheck, Test, and Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cellweave-web
+        uses: actions/checkout@v4
+
+      - name: Checkout cellweave-contracts
+        uses: actions/checkout@v4
+        with:
+          repository: cell-weave/cellweave-contracts
+          path: ../cellweave-contracts
+        continue-on-error: true
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Check Formatting
+        run: pnpm run format:check
+
+      - name: TypeScript Typecheck
+        run: pnpm run typecheck
+
+      - name: Unit Tests
+        run: pnpm run test
+
+      - name: Authorization Tests
+        run: pnpm run test:auth
+
+      - name: DB Migration Validation
+        run: pnpm run db:validate
+
+      - name: Next.js Build
+        run: pnpm run build
+
+      - name: Playwright Smoke Tests
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm run test:smoke
