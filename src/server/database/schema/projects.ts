@@ -1,6 +1,11 @@
 import { pgTable, text, timestamp, index } from "drizzle-orm/pg-core";
 import { organizations } from "./organizations";
 
+/**
+ * Projects Schema (Phase 0 Structural Scaffold)
+ * Demonstrates the tenant isolation pattern (organizationId foreign key & index).
+ * Full project lifecycle, metadata, and permissions activate in Phase 2.
+ */
 export const projects = pgTable(
   "projects",
   {
@@ -9,15 +14,7 @@ export const projects = pgTable(
       .notNull()
       .references(() => organizations.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
-    description: text("description"),
-    status: text("status").default("active").notNull(),
-    createdBy: text("created_by").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
-    archivedAt: timestamp("archived_at", { withTimezone: true }),
   },
-  (table) => [
-    index("projects_org_idx").on(table.organizationId),
-    index("projects_org_status_idx").on(table.organizationId, table.status),
-  ]
+  (table) => [index("projects_org_idx").on(table.organizationId)]
 );

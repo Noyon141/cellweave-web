@@ -1,10 +1,5 @@
 import { describe, it, expect } from "vitest";
-import {
-  organizations,
-  organizationSettings,
-  projects,
-  auditEvents,
-} from "@/server/database/schema";
+import { organizations, projects, auditEvents } from "@/server/database/schema";
 import { getTableColumns } from "drizzle-orm";
 
 describe("Database Schema & Tenant Isolation Invariant Validation", () => {
@@ -12,10 +7,6 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
     const projectCols = getTableColumns(projects);
     expect(projectCols).toHaveProperty("organizationId");
     expect(projectCols.organizationId.notNull).toBe(true);
-
-    const settingsCols = getTableColumns(organizationSettings);
-    expect(settingsCols).toHaveProperty("organizationId");
-    expect(settingsCols.organizationId.notNull).toBe(true);
 
     const auditCols = getTableColumns(auditEvents);
     expect(auditCols).toHaveProperty("organizationId");

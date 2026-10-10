@@ -9,6 +9,11 @@ import type {
 import type { OrganizationId } from "@/types";
 import { env } from "@/server/config/env";
 
+/**
+ * Polar Billing Provider (Phase 0 Structural Scaffold)
+ * Encapsulates the BillingProvider boundary.
+ * Live checkout, usage metering, and billing synchronization activate in Phase 11.
+ */
 export class PolarBillingProvider implements BillingProvider {
   private readonly accessToken: string;
 
@@ -16,27 +21,20 @@ export class PolarBillingProvider implements BillingProvider {
     this.accessToken = accessToken;
   }
 
-  async createCheckout(params: CreateCheckoutParams): Promise<CheckoutSession> {
-    // Adapter boundary implementation (Phase 0 Foundation)
-    return {
-      checkoutUrl: `https://sandbox.polar.sh/checkout?org=${params.organizationId}&plan=${params.planId}`,
-      sessionId: `sess_${params.organizationId}_${Date.now()}`,
-    };
+  async createCheckout(_params: CreateCheckoutParams): Promise<CheckoutSession> {
+    throw new Error("Polar checkout integration activates in Phase 11");
   }
 
   async getSubscription(_organizationId: OrganizationId): Promise<SubscriptionInfo | null> {
-    // Adapter boundary implementation (Phase 0 Foundation)
     return null;
   }
 
   async reportUsage(_params: ReportUsageParams): Promise<{ readonly acknowledged: boolean }> {
-    // Adapter boundary implementation (Phase 0 Foundation)
-    return { acknowledged: true };
+    throw new Error("Polar usage reporting activates in Phase 11");
   }
 
-  async customerPortal(params: CustomerPortalParams): Promise<{ readonly url: string }> {
-    // Adapter boundary implementation (Phase 0 Foundation)
-    return { url: `${params.returnUrl}?portal=active` };
+  async customerPortal(_params: CustomerPortalParams): Promise<{ readonly url: string }> {
+    throw new Error("Polar customer portal activates in Phase 11");
   }
 }
 
