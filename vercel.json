@@ -3,7 +3,7 @@
   "framework": "nextjs",
   "buildCommand": "pnpm build",
   "installCommand": "pnpm install",
-  "regions": ["iad1", "cle1"],
+  "regions": ["cle1"],
   "headers": [
     {
       "source": "/(.*)",
