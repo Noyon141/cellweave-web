@@ -7,7 +7,7 @@ import { getHealthService } from "@/server/application/health-service";
  */
 export async function GET() {
   const healthService = getHealthService();
-  const status = healthService.getHealthStatus();
+  const status = await healthService.getHealthStatus();
 
   return NextResponse.json(status, { status: 200 });
 }
