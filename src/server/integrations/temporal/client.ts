@@ -18,16 +18,21 @@ export class TemporalClientService {
 
   async getClient(): Promise<Client> {
     if (!this.client) {
+      const tlsConfig = env.TEMPORAL_CLIENT_CERT
+        ? {
+            clientCertPair: {
+              crt: Buffer.from(env.TEMPORAL_CLIENT_CERT, "utf-8"),
+              key: Buffer.from(env.TEMPORAL_CLIENT_KEY ?? "", "utf-8"),
+            },
+          }
+        : env.TEMPORAL_API_KEY
+          ? true
+          : undefined;
+
       const connection = await Connection.connect({
         address: env.TEMPORAL_ADDRESS,
-        tls: env.TEMPORAL_CLIENT_CERT
-          ? {
-              clientCertPair: {
-                crt: Buffer.from(env.TEMPORAL_CLIENT_CERT, "utf-8"),
-                key: Buffer.from(env.TEMPORAL_CLIENT_KEY ?? "", "utf-8"),
-              },
-            }
-          : undefined,
+        apiKey: env.TEMPORAL_API_KEY,
+        tls: tlsConfig,
       });
 
       const options: ClientOptions = {

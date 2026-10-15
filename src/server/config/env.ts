@@ -31,6 +31,7 @@ const envSchema = z.object({
   // Temporal Cloud
   TEMPORAL_ADDRESS: z.string().default("cellweave.tmprl.cloud:7233"),
   TEMPORAL_NAMESPACE: z.string().default("cellweave-dev.default"),
+  TEMPORAL_API_KEY: z.string().optional(),
   TEMPORAL_CLIENT_CERT: z.string().optional(),
   TEMPORAL_CLIENT_KEY: z.string().optional(),
 
