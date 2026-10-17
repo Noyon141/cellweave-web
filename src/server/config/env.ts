@@ -22,6 +22,12 @@ export const envSchema = z.object({
     .min(32, "BETTER_AUTH_SECRET must be at least 32 characters for high-entropy signing"),
   BETTER_AUTH_URL: z.string().url("BETTER_AUTH_URL must be a valid URL"),
 
+  // Audit IP Privacy Key (Keyed HMAC for privacy-preserving client IP pseudonymization)
+  AUDIT_IP_HASH_SECRET: z
+    .string()
+    .min(16, "AUDIT_IP_HASH_SECRET must be at least 16 characters")
+    .default("cellweave_audit_ip_hash_salt_dev_local_secret"),
+
   // Google OAuth (Phase 1 Identity; strictly required in real DEV/STAGING runtimes)
   GOOGLE_CLIENT_ID: z.string().min(1, "GOOGLE_CLIENT_ID is required"),
   GOOGLE_CLIENT_SECRET: z.string().min(1, "GOOGLE_CLIENT_SECRET is required"),
