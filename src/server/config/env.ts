@@ -62,7 +62,11 @@ let parsedEnv: Env | null = null;
 
 export function getEnv(): Env {
   if (!parsedEnv) {
-    const result = envSchema.safeParse(process.env);
+    const rawEnv = {
+      ...process.env,
+      BETTER_AUTH_URL: process.env.BETTER_AUTH_URL ?? process.env.BETTERAUTH_URL,
+    };
+    const result = envSchema.safeParse(rawEnv);
     if (!result.success) {
       const formatted = result.error.format();
       // Safe error reporting: never print secret values
