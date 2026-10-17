@@ -12,20 +12,34 @@ import {
 
 export function handleRouteError(error: unknown): NextResponse {
   if (error instanceof UnauthenticatedError) {
-    return NextResponse.json({ error: "UNAUTHENTICATED", message: error.message }, { status: 401 });
+    return NextResponse.json(
+      { error: "UNAUTHENTICATED", message: "Authentication required" },
+      { status: 401 }
+    );
   }
 
+  // Priority check: ResourceNotFoundError extends TenantAuthorizationError
+  // It must be checked before TenantAuthorizationError to return HTTP 404
+  if (error instanceof ResourceNotFoundError) {
+    return NextResponse.json(
+      { error: "NOT_FOUND", message: "Resource not found" },
+      { status: 404 }
+    );
+  }
+
+  // Generic non-disclosing authorization failure response
+  // TenantContextRequiredError, TenantMembershipNotFoundError, and InvalidOrganizationRoleError
+  // all inherit from TenantAuthorizationError
   if (
     error instanceof TenantContextRequiredError ||
     error instanceof TenantMembershipNotFoundError ||
     error instanceof InvalidOrganizationRoleError ||
     error instanceof TenantAuthorizationError
   ) {
-    return NextResponse.json({ error: "FORBIDDEN", message: error.message }, { status: 403 });
-  }
-
-  if (error instanceof ResourceNotFoundError) {
-    return NextResponse.json({ error: "NOT_FOUND", message: error.message }, { status: 404 });
+    return NextResponse.json(
+      { error: "FORBIDDEN", message: "You are not authorized to access this resource." },
+      { status: 403 }
+    );
   }
 
   if (error instanceof ConflictError) {

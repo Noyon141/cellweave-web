@@ -215,7 +215,10 @@ export class InvitationService {
     context: TenantContext,
     targetOrganizationId: string,
     rawInput: CreateInvitationInput,
-    options?: { headers?: Headers }
+    options?: {
+      headers?: Headers;
+      requestMetadata?: { clientIp?: string | null; userAgent?: string | null };
+    }
   ): Promise<InvitationDTO> {
     validateTenantAccess(context, targetOrganizationId);
     assertOrgAdmin(context);
@@ -296,6 +299,8 @@ export class InvitationService {
         role,
         expiresAt: expiresAt.toISOString(),
       },
+      clientIp: options?.requestMetadata?.clientIp,
+      userAgent: options?.requestMetadata?.userAgent,
       timestamp: now,
     });
 
@@ -343,7 +348,10 @@ export class InvitationService {
     context: TenantContext,
     targetOrganizationId: string,
     targetInvitationId: string,
-    options?: { headers?: Headers }
+    options?: {
+      headers?: Headers;
+      requestMetadata?: { clientIp?: string | null; userAgent?: string | null };
+    }
   ): Promise<void> {
     validateTenantAccess(context, targetOrganizationId);
     assertOrgAdmin(context);
@@ -389,6 +397,8 @@ export class InvitationService {
       resourceType: "invitation",
       resourceId: target.id,
       metadata: {},
+      clientIp: options?.requestMetadata?.clientIp,
+      userAgent: options?.requestMetadata?.userAgent,
       timestamp: now,
     });
 

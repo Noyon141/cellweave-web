@@ -7,7 +7,7 @@ describe("HealthService", () => {
     const status = await service.getHealthStatus();
 
     expect(status.status).toBe("ok");
-    expect(status.phase).toBe("Phase 0 — Foundations");
+    expect(status.phase).toBe("Phase 1 — Identity & Tenancy");
     expect(status.service).toBe("cellweave-web");
     expect(status.version).toBe("0.1.0");
     expect(status.ruo).toBe(true);

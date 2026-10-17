@@ -24,7 +24,7 @@ test.describe("Phase 0 Placeholder Service Smoke Tests", () => {
     expect(response.ok()).toBeTruthy();
     const body = await response.json();
     expect(body.status).toBe("ok");
-    expect(body.phase).toBe("Phase 0 — Foundations");
+    expect(body.phase).toBe("Phase 1 — Identity & Tenancy");
   });
 
   test("polar webhook returns phase 0 placeholder response without billing logic", async ({

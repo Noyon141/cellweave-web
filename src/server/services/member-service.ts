@@ -167,7 +167,10 @@ export class MemberService {
     targetOrganizationId: string,
     targetMemberId: string,
     newRole: string,
-    options?: { headers?: Headers }
+    options?: {
+      headers?: Headers;
+      requestMetadata?: { clientIp?: string | null; userAgent?: string | null };
+    }
   ): Promise<MemberDTO> {
     validateTenantAccess(context, targetOrganizationId);
     assertOrgAdmin(context);
@@ -249,6 +252,8 @@ export class MemberService {
         previousRole: currentTargetRole,
         newRole: targetRole,
       },
+      clientIp: options?.requestMetadata?.clientIp,
+      userAgent: options?.requestMetadata?.userAgent,
       timestamp: now,
     });
 
@@ -290,7 +295,10 @@ export class MemberService {
     context: TenantContext,
     targetOrganizationId: string,
     targetMemberId: string,
-    options?: { headers?: Headers }
+    options?: {
+      headers?: Headers;
+      requestMetadata?: { clientIp?: string | null; userAgent?: string | null };
+    }
   ): Promise<void> {
     validateTenantAccess(context, targetOrganizationId);
     assertOrgAdmin(context);
@@ -346,6 +354,8 @@ export class MemberService {
         targetUserId: target.userId,
         role: targetRole,
       },
+      clientIp: options?.requestMetadata?.clientIp,
+      userAgent: options?.requestMetadata?.userAgent,
       timestamp: now,
     });
 

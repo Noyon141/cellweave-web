@@ -184,7 +184,8 @@ export class ProjectPermissionService {
   async assignMemberToProject(
     context: TenantContext,
     projectId: string,
-    targetUserId: string
+    targetUserId: string,
+    options?: { requestMetadata?: { clientIp?: string | null; userAgent?: string | null } }
   ): Promise<ProjectMemberDTO> {
     assertOrgAdmin(context);
 
@@ -278,6 +279,8 @@ export class ProjectPermissionService {
           projectId,
           targetUserId,
         },
+        clientIp: options?.requestMetadata?.clientIp,
+        userAgent: options?.requestMetadata?.userAgent,
         timestamp: now,
       });
 
@@ -324,7 +327,8 @@ export class ProjectPermissionService {
   async removeMemberFromProject(
     context: TenantContext,
     projectId: string,
-    targetUserId: string
+    targetUserId: string,
+    options?: { requestMetadata?: { clientIp?: string | null; userAgent?: string | null } }
   ): Promise<void> {
     assertOrgAdmin(context);
 
@@ -386,6 +390,8 @@ export class ProjectPermissionService {
           projectId,
           targetUserId,
         },
+        clientIp: options?.requestMetadata?.clientIp,
+        userAgent: options?.requestMetadata?.userAgent,
         timestamp: now,
       });
 

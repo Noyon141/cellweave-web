@@ -21,7 +21,7 @@ export interface OrchestrationHealthInfo {
 
 export interface HealthStatus {
   readonly status: "ok" | "degraded";
-  readonly phase: "Phase 0 — Foundations";
+  readonly phase: "Phase 1 — Identity & Tenancy";
   readonly service: "cellweave-web";
   readonly version: string;
   readonly timestamp: string;
@@ -75,7 +75,7 @@ export class HealthService {
 
     return {
       status: "ok",
-      phase: "Phase 0 — Foundations",
+      phase: "Phase 1 — Identity & Tenancy",
       service: "cellweave-web",
       version: "0.1.0",
       timestamp: new Date().toISOString(),

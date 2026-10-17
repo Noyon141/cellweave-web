@@ -153,7 +153,8 @@ export class OrganizationService {
   async updateSettings(
     context: TenantContext,
     targetOrganizationId: string,
-    rawInput: UpdateOrganizationSettingsInput
+    rawInput: UpdateOrganizationSettingsInput,
+    options?: { requestMetadata?: { clientIp?: string | null; userAgent?: string | null } }
   ): Promise<OrganizationSettingsDTO> {
     validateTenantAccess(context, targetOrganizationId);
     assertOrgAdmin(context);
@@ -268,6 +269,8 @@ export class OrganizationService {
           exportPermissions: updated.exportPermissions,
           projectVisibility: updated.projectVisibility,
         },
+        clientIp: options?.requestMetadata?.clientIp,
+        userAgent: options?.requestMetadata?.userAgent,
         timestamp: now,
       });
 

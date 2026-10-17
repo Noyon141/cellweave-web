@@ -170,9 +170,7 @@ export function validateTenantAccess(
   }
 
   if (tenant.organizationId !== targetOrganizationId) {
-    throw new TenantAuthorizationError(
-      `Cross-tenant access prohibited. Context: ${tenant.organizationId}, Target: ${targetOrganizationId}`
-    );
+    throw new TenantAuthorizationError("Cross-tenant access prohibited");
   }
 
   return tenant.organizationId;

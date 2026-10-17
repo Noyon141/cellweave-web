@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { resolveTenantContext } from "@/server/authorization";
 import { InvitationService, createInvitationSchema } from "@/server/services/invitation-service";
 import { handleRouteError } from "@/server/api/error-handler";
+import { extractRequestAuditMetadata } from "@/server/api/request-metadata";
 
 interface RouteParams {
   params: Promise<{ orgId: string }>;
@@ -26,9 +27,13 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const context = await resolveTenantContext({ requestOrHeaders: request });
     const rawBody = await request.json();
     const validatedBody = createInvitationSchema.parse(rawBody);
+    const requestMetadata = extractRequestAuditMetadata(request);
 
     const service = new InvitationService();
-    const data = await service.createInvitation(context, orgId, validatedBody);
+    const data = await service.createInvitation(context, orgId, validatedBody, {
+      headers: request.headers,
+      requestMetadata,
+    });
 
     return NextResponse.json({ data }, { status: 201 });
   } catch (error) {
