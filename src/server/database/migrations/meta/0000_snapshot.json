@@ -1,5 +1,5 @@
 {
-  "id": "de4cb7b0-7f4b-4718-8ae7-fb5df659f5a9",
+  "id": "c077d0f5-bbdf-4aac-b5cc-5dc4d4afa3df",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -261,8 +261,7 @@
           "name": "role",
           "type": "text",
           "primaryKey": false,
-          "notNull": true,
-          "default": "'member'"
+          "notNull": true
         },
         "created_at": {
           "name": "created_at",
@@ -326,7 +325,12 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "member_role_check": {
+          "name": "member_role_check",
+          "value": "\"member\".\"role\" IN ('owner', 'admin', 'bioinformatician', 'scientist', 'viewer')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.organization": {
@@ -370,23 +374,7 @@
           "notNull": false
         }
       },
-      "indexes": {
-        "organization_slug_uidx": {
-          "name": "organization_slug_uidx",
-          "columns": [
-            {
-              "expression": "slug",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
+      "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {

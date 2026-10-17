@@ -29,8 +29,9 @@ CREATE TABLE "member" (
 	"id" text PRIMARY KEY NOT NULL,
 	"organization_id" text NOT NULL,
 	"user_id" text NOT NULL,
-	"role" text DEFAULT 'member' NOT NULL,
-	"created_at" timestamp NOT NULL
+	"role" text NOT NULL,
+	"created_at" timestamp NOT NULL,
+	CONSTRAINT "member_role_check" CHECK ("member"."role" IN ('owner', 'admin', 'bioinformatician', 'scientist', 'viewer'))
 );
 --> statement-breakpoint
 CREATE TABLE "organization" (
@@ -142,7 +143,6 @@ CREATE INDEX "invitation_organizationId_idx" ON "invitation" USING btree ("organ
 CREATE INDEX "invitation_email_idx" ON "invitation" USING btree ("email");--> statement-breakpoint
 CREATE INDEX "member_organizationId_idx" ON "member" USING btree ("organization_id");--> statement-breakpoint
 CREATE INDEX "member_userId_idx" ON "member" USING btree ("user_id");--> statement-breakpoint
-CREATE UNIQUE INDEX "organization_slug_uidx" ON "organization" USING btree ("slug");--> statement-breakpoint
 CREATE INDEX "session_userId_idx" ON "session" USING btree ("user_id");--> statement-breakpoint
 CREATE INDEX "verification_identifier_idx" ON "verification" USING btree ("identifier");--> statement-breakpoint
 CREATE INDEX "project_members_org_idx" ON "project_members" USING btree ("organization_id");--> statement-breakpoint
@@ -155,6 +155,6 @@ CREATE INDEX "audit_events_org_idx" ON "audit_events" USING btree ("organization
 CREATE INDEX "audit_events_actor_idx" ON "audit_events" USING btree ("actor_id");--> statement-breakpoint
 CREATE INDEX "audit_events_action_idx" ON "audit_events" USING btree ("action");--> statement-breakpoint
 CREATE INDEX "audit_events_created_at_idx" ON "audit_events" USING btree ("created_at");--> statement-breakpoint
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO cellweave_app;--> statement-breakpoint
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO cellweave_app;--> statement-breakpoint
-REVOKE UPDATE, DELETE ON audit_events FROM cellweave_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "user", "session", "account", "verification", "organization", "member", "invitation", "organization_settings", "projects", "project_members" TO cellweave_app;--> statement-breakpoint
+GRANT SELECT, INSERT ON TABLE "audit_events" TO cellweave_app;--> statement-breakpoint
+REVOKE UPDATE, DELETE ON TABLE "audit_events" FROM cellweave_app;

@@ -1,8 +1,8 @@
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { organization } from "better-auth/plugins/organization";
-import { getDb } from "@/server/database/client";
-import { env } from "@/server/config/env";
+import { getDb } from "../../database/client";
+import { env } from "../../config/env";
 import { ac, roles } from "./permissions";
 
 /**
@@ -45,6 +45,7 @@ export function getAuthConfig(): BetterAuthOptions {
       organization({
         ac,
         roles,
+        creatorRole: "owner",
       }),
     ],
   };

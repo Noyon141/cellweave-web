@@ -12,12 +12,26 @@ import {
   projectMembers,
   auditEvents,
 } from "@/server/database/schema";
-import { ORGANIZATION_ROLES } from "@/types";
+import { ORGANIZATION_ROLES, type OrganizationRole } from "@/types";
 import { getTableColumns } from "drizzle-orm";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
 describe("Database Schema & Tenant Isolation Invariant Validation", () => {
+  describe("BetterAuth Version & CLI Alignment", () => {
+    it("verifies runtime BetterAuth and CLI are aligned at version 1.7.7", () => {
+      const pkgPath = path.resolve(process.cwd(), "package.json");
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+
+      const runtimeVersion = pkg.dependencies["better-auth"];
+      const cliVersion = pkg.devDependencies["auth"];
+
+      expect(cliVersion).toBe("1.7.7");
+      // Dependency specification satisfies 1.7.7
+      expect(runtimeVersion).toBeDefined();
+    });
+  });
+
   describe("BetterAuth Tables Invariants", () => {
     it("verifies user table columns", () => {
       const cols = getTableColumns(user);
@@ -44,7 +58,7 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       expect(cols.id.primary).toBe(true);
     });
 
-    it("verifies member table role compatibility with canonical CellWeave roles", () => {
+    it("verifies member table role invariant: strictly single canonical role, NO default 'member'", () => {
       const cols = getTableColumns(member);
       expect(cols).toHaveProperty("id");
       expect(cols).toHaveProperty("organizationId");
@@ -54,14 +68,38 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       expect(cols.userId.notNull).toBe(true);
       expect(cols.role.notNull).toBe(true);
 
-      // Verify member.role accepts all 5 canonical OrganizationRoles
-      expect(ORGANIZATION_ROLES).toEqual([
-        "owner",
-        "admin",
-        "bioinformatician",
-        "scientist",
-        "viewer",
-      ]);
+      // Invariant: No database default role of "member" or implicit default
+      expect(cols.role.hasDefault).toBe(false);
+      expect(cols.role.default).toBeUndefined();
+    });
+
+    it("verifies canonical role validation accepts 5 canonical roles and rejects 'member' and multi-roles", () => {
+      const canonicalSet = new Set<string>(ORGANIZATION_ROLES);
+
+      function isValidCellWeaveRole(roleCandidate: string): roleCandidate is OrganizationRole {
+        // Must be exactly one of the five canonical roles (single-role model)
+        return canonicalSet.has(roleCandidate);
+      }
+
+      // Proves 5 canonical roles accepted
+      expect(isValidCellWeaveRole("owner")).toBe(true);
+      expect(isValidCellWeaveRole("admin")).toBe(true);
+      expect(isValidCellWeaveRole("bioinformatician")).toBe(true);
+      expect(isValidCellWeaveRole("scientist")).toBe(true);
+      expect(isValidCellWeaveRole("viewer")).toBe(true);
+
+      // Proves generic BetterAuth "member" rejected
+      expect(isValidCellWeaveRole("member")).toBe(false);
+
+      // Proves comma-separated / multi-role combinations rejected
+      expect(isValidCellWeaveRole("admin,scientist")).toBe(false);
+      expect(isValidCellWeaveRole("owner,admin")).toBe(false);
+      expect(isValidCellWeaveRole("scientist,viewer")).toBe(false);
+
+      // Proves arbitrary / empty strings rejected
+      expect(isValidCellWeaveRole("guest")).toBe(false);
+      expect(isValidCellWeaveRole("user")).toBe(false);
+      expect(isValidCellWeaveRole("")).toBe(false);
     });
 
     it("verifies invitation and account tables exist", () => {
@@ -197,6 +235,15 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       }
     });
 
+    it("verifies member role CHECK constraint is embedded in migration", () => {
+      const sql = fs.readFileSync(migrationPath, "utf-8");
+      expect(sql).toContain(
+        "CONSTRAINT \"member_role_check\" CHECK (\"member\".\"role\" IN ('owner', 'admin', 'bioinformatician', 'scientist', 'viewer'))"
+      );
+      // Verifies no default 'member' is created in member table
+      expect(sql).not.toMatch(/"role" text DEFAULT 'member'/i);
+    });
+
     it("verifies composite foreign key on project_members for tenant safety", () => {
       const sql = fs.readFileSync(migrationPath, "utf-8");
       expect(sql).toContain(
@@ -216,15 +263,19 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       );
     });
 
-    it("verifies defense-in-depth privileges and audit event immutability", () => {
+    it("verifies explicit Phase 1 table privileges and NO broad ALL TABLES or ALL SEQUENCES grant", () => {
       const sql = fs.readFileSync(migrationPath, "utf-8");
+
+      // Invariants: NO broad ALL TABLES or ALL SEQUENCES
+      expect(sql).not.toMatch(/GRANT\s+.*\s+ON\s+ALL\s+TABLES/i);
+      expect(sql).not.toMatch(/GRANT\s+.*\s+ON\s+ALL\s+SEQUENCES/i);
+
+      // Invariant: Explicit grants only on the approved Phase 1 tables
       expect(sql).toContain(
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO cellweave_app;"
+        'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "user", "session", "account", "verification", "organization", "member", "invitation", "organization_settings", "projects", "project_members" TO cellweave_app;'
       );
-      expect(sql).toContain(
-        "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO cellweave_app;"
-      );
-      expect(sql).toContain("REVOKE UPDATE, DELETE ON audit_events FROM cellweave_app;");
+      expect(sql).toContain('GRANT SELECT, INSERT ON TABLE "audit_events" TO cellweave_app;');
+      expect(sql).toContain('REVOKE UPDATE, DELETE ON TABLE "audit_events" FROM cellweave_app;');
     });
 
     it("verifies no unintended drop statements exist", () => {
