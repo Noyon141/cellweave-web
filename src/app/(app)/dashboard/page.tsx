@@ -210,10 +210,11 @@ export default function DashboardPage() {
         const auditRes = await fetch(`/api/v1/organizations/${orgId}/audit-events`);
         const auditJson = await auditRes.json();
         if (auditRes.status === 200 && Array.isArray(auditJson.data)) {
+          const latest = auditJson.data[0];
           addLog(
             "8. Audit Trail Verification",
             "success",
-            `HTTP 200 OK — Retrieved ${auditJson.data.length} audit event(s): ${auditJson.data.map((e: { action: string }) => e.action).join(", ")}`
+            `HTTP 200 OK — Retrieved ${auditJson.data.length} event(s). Latest: action="${latest?.action}", userAgent="${latest?.userAgent || "null"}", ipHash=${latest?.ipHash ? latest.ipHash.slice(0, 16) + "..." : "null"}`
           );
         } else {
           addLog(
