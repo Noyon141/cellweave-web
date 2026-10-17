@@ -150,6 +150,7 @@ export default function DashboardPage() {
             <p><strong>User ID:</strong> <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{sessionData.user.id}</code></p>
             <p><strong>Session ID:</strong> <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{sessionData.session.id}</code></p>
             <p><strong>Active Org ID:</strong> {sessionData.session.activeOrganizationId || <em className="text-amber-600 dark:text-amber-400">null (unassigned)</em>}</p>
+            {createdOrgId && <p><strong>Verified Org ID:</strong> <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{createdOrgId}</code></p>}
           </div>
         ) : (
           <p className="text-sm text-destructive mt-2">No active session detected. Please sign in via /login.</p>
