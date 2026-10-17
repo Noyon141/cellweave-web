@@ -6,6 +6,7 @@ import {
 import { TenantAuthorizationError } from "@/server/authorization";
 import type { TenantContext, OrganizationRole } from "@/types";
 import type { DbClient } from "@/server/database/client";
+import { auditEvents } from "@/server/database/schema/audit-events";
 
 function makeContext(
   role: OrganizationRole,
@@ -55,6 +56,7 @@ describe("Organization Settings Application Service Tests (Step F)", () => {
   describe("Update Authorization", () => {
     it("owner can update settings", async () => {
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]), // upsert insert branch
@@ -77,6 +79,7 @@ describe("Organization Settings Application Service Tests (Step F)", () => {
 
     it("admin can update settings", async () => {
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
@@ -117,14 +120,17 @@ describe("Organization Settings Application Service Tests (Step F)", () => {
     it("missing settings row upserts safely on insert branch", async () => {
       let insertedValues: Record<string, unknown> | null = null;
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]), // no existing row
           }),
         }),
-        insert: () => ({
+        insert: (table?: unknown) => ({
           values: (vals: Record<string, unknown>) => {
-            insertedValues = vals;
+            if (table !== auditEvents) {
+              insertedValues = vals;
+            }
             return Promise.resolve();
           },
         }),
@@ -157,6 +163,7 @@ describe("Organization Settings Application Service Tests (Step F)", () => {
 
       let updatedValues: Record<string, unknown> | null = null;
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([existing]),
@@ -169,6 +176,9 @@ describe("Organization Settings Application Service Tests (Step F)", () => {
               return Promise.resolve();
             },
           }),
+        }),
+        insert: () => ({
+          values: () => Promise.resolve(),
         }),
       } as unknown as DbClient;
 
@@ -187,6 +197,7 @@ describe("Organization Settings Application Service Tests (Step F)", () => {
 
     it("organizationId in input cannot override TenantContext (body override immunity)", async () => {
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
@@ -227,6 +238,7 @@ describe("Organization Settings Application Service Tests (Step F)", () => {
     it("triggers audit hook on update", async () => {
       const auditHook = vi.fn();
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
@@ -249,6 +261,36 @@ describe("Organization Settings Application Service Tests (Step F)", () => {
           actorId: "usr_auditor",
         })
       );
+    });
+
+    it("rolls back mutation when transactional audit persistence fails", async () => {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+        select: () => ({
+          from: () => ({
+            where: () => Promise.resolve([]),
+          }),
+        }),
+        insert: () => ({
+          values: () => Promise.resolve(),
+        }),
+      } as unknown as DbClient;
+
+      const mockFailingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB unreachable")),
+      };
+
+      const service = new OrganizationService({
+        dbClient: mockDb,
+        auditService: mockFailingAuditService as unknown as InstanceType<
+          typeof import("@/server/services/audit-service").AuditService
+        >,
+      });
+      const ctx = makeContext("owner", "org_alpha");
+
+      await expect(
+        service.updateSettings(ctx, "org_alpha", { defaultRetentionDays: 30 })
+      ).rejects.toThrow("Audit DB unreachable");
     });
   });
 

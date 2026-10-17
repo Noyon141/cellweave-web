@@ -1,22 +1,16 @@
 import { describe, it, expect, vi } from "vitest";
 import { AuditService } from "@/server/services/audit-service";
 import { hashIpAddress, sanitizeAuditMetadata } from "@/server/services/audit-privacy";
-import {
-  createOrganizationAuditHook,
-  createMemberAuditHook,
-  createInvitationAuditHook,
-  createProjectAuditHook,
-} from "@/server/services/audit-hook-wiring";
 import { OrganizationService } from "@/server/services/organization-service";
 import { MemberService } from "@/server/services/member-service";
 import { InvitationService } from "@/server/services/invitation-service";
 import { ProjectPermissionService } from "@/server/services/project-permission-service";
 import { TenantAuthorizationError, ValidationError } from "@/server/authorization";
 import type { TenantContext, OrganizationRole } from "@/types";
-import type { DbClient } from "@/server/database/client";
+import type { DbClient, DatabaseExecutor } from "@/server/database/client";
 import { auditEvents } from "@/server/database/schema/audit-events";
-import { projects } from "@/server/database/schema/projects";
-import { member } from "@/server/database/schema/auth";
+import { projects, projectMembers } from "@/server/database/schema/projects";
+import { member, invitation } from "@/server/database/schema/auth";
 
 function makeContext(
   role: OrganizationRole,
@@ -32,7 +26,7 @@ function makeContext(
 
 describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
   describe("1-6. Append-Only Event Persistence & Actor Derivation", () => {
-    it("1. recordAuditEvent inserts valid event", async () => {
+    it("1. recordUserAuditEvent inserts valid event", async () => {
       let insertedValues: Record<string, unknown> | null = null;
       const mockDb = {
         insert: (table: unknown) => ({
@@ -48,7 +42,7 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       const service = new AuditService({ dbClient: mockDb });
       const ctx = makeContext("owner", "org_alpha", "usr_alice");
 
-      const event = await service.recordAuditEvent({
+      const event = await service.recordUserAuditEvent({
         context: ctx,
         action: "test.action",
         resourceType: "test_resource",
@@ -67,7 +61,7 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       expect(insertedValues!.action).toBe("test.action");
     });
 
-    it("2-4. organizationId, actorId, and actorType derive from TenantContext", async () => {
+    it("2-4. organizationId, actorId, and actorType derive strictly from TenantContext", async () => {
       let insertedValues: Record<string, unknown> | null = null;
       const mockDb = {
         insert: () => ({
@@ -81,7 +75,7 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       const service = new AuditService({ dbClient: mockDb });
       const ctx = makeContext("scientist", "org_real_tenant", "usr_scientist_99");
 
-      await service.recordAuditEvent({
+      await service.recordUserAuditEvent({
         context: ctx,
         action: "test.derived_actor",
         resourceType: "sample",
@@ -91,6 +85,40 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       expect(insertedValues!.organizationId).toBe("org_real_tenant");
       expect(insertedValues!.actorId).toBe("usr_scientist_99");
       expect(insertedValues!.actorType).toBe("user");
+    });
+
+    it("executes insert on supplied transactional DatabaseExecutor (tx)", async () => {
+      let txInserted = false;
+      const mockTx: DatabaseExecutor = {
+        select: vi.fn(),
+        update: vi.fn(),
+        delete: vi.fn(),
+        insert: (table: unknown) => ({
+          values: () => {
+            if (table === auditEvents) txInserted = true;
+            return Promise.resolve();
+          },
+        }),
+      } as unknown as DatabaseExecutor;
+
+      const fallbackDb = {
+        insert: () => {
+          throw new Error("Fallback DB should not be called when tx is provided");
+        },
+      } as unknown as DbClient;
+
+      const service = new AuditService({ dbClient: fallbackDb });
+      const ctx = makeContext("owner", "org_alpha", "usr_tx_test");
+
+      await service.recordUserAuditEvent({
+        db: mockTx,
+        context: ctx,
+        action: "tx.action",
+        resourceType: "tx_resource",
+        resourceId: "res_tx",
+      });
+
+      expect(txInserted).toBe(true);
     });
 
     it("5-6. no update or delete method exists on AuditService", () => {
@@ -262,61 +290,47 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
     });
   });
 
-  describe("17-23. Step F and Step G Event Wiring & Consistency", () => {
-    it("17. settings update persists org_settings.updated audit event", async () => {
+  describe("17-23. Transactional Audit Consistency across Step F and Step G Services", () => {
+    it("17. settings update persists org_settings.updated audit event atomically", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      const mockAuditDb = {
-        insert: () => ({
-          values: (vals: Record<string, unknown>) => {
-            insertedAudit = vals;
-            return Promise.resolve();
-          },
-        }),
-      } as unknown as DbClient;
+      let insertedSettings: Record<string, unknown> | null = null;
 
-      const auditService = new AuditService({ dbClient: mockAuditDb });
-      const auditHook = createOrganizationAuditHook(auditService);
-
-      const mockOrgDb = {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
           }),
         }),
-        insert: () => ({
-          values: () => Promise.resolve(),
-        }),
-      } as unknown as DbClient;
-
-      const orgService = new OrganizationService({
-        dbClient: mockOrgDb,
-        auditHook,
-      });
-
-      const ctx = makeContext("owner", "org_alpha", "usr_owner_1");
-      await orgService.updateSettings(ctx, "org_alpha", {
-        defaultRetentionDays: 60,
-      });
-
-      expect(insertedAudit).not.toBeNull();
-      expect(insertedAudit!.action).toBe("org_settings.updated");
-      expect(insertedAudit!.organizationId).toBe("org_alpha");
-      expect(insertedAudit!.actorId).toBe("usr_owner_1");
-    });
-
-    it("18. member role change persists member.role_changed audit event", async () => {
-      let insertedAudit: Record<string, unknown> | null = null;
-      const mockAuditDb = {
-        insert: () => ({
+        insert: (table: unknown) => ({
           values: (vals: Record<string, unknown>) => {
-            insertedAudit = vals;
+            if (table === auditEvents) {
+              insertedAudit = vals;
+            } else {
+              insertedSettings = vals;
+            }
             return Promise.resolve();
           },
         }),
       } as unknown as DbClient;
 
-      const auditService = new AuditService({ dbClient: mockAuditDb });
-      const auditHook = createMemberAuditHook(auditService);
+      const orgService = new OrganizationService({ dbClient: mockDb });
+      const ctx = makeContext("owner", "org_alpha", "usr_owner_1");
+      await orgService.updateSettings(ctx, "org_alpha", {
+        defaultRetentionDays: 60,
+      });
+
+      expect(insertedSettings).not.toBeNull();
+      expect(insertedAudit).not.toBeNull();
+      expect(insertedAudit!.action).toBe("org_settings.updated");
+      expect(insertedAudit!.organizationId).toBe("org_alpha");
+      expect(insertedAudit!.actorId).toBe("usr_owner_1");
+      expect(insertedAudit!.actorType).toBe("user");
+    });
+
+    it("18. member role change persists member.role_changed audit event atomically", async () => {
+      let insertedAudit: Record<string, unknown> | null = null;
+      let updatedRole: string | null = null;
 
       const targetMember = {
         id: "mem_2",
@@ -329,7 +343,8 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         userImage: null,
       };
 
-      const mockMemberDb = {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -338,20 +353,28 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
           }),
         }),
         update: () => ({
-          set: () => ({
-            where: () => Promise.resolve(),
-          }),
+          set: (vals: { role: string }) => {
+            updatedRole = vals.role;
+            return {
+              where: () => Promise.resolve(),
+            };
+          },
+        }),
+        insert: (table: unknown) => ({
+          values: (vals: Record<string, unknown>) => {
+            if (table === auditEvents) {
+              insertedAudit = vals;
+            }
+            return Promise.resolve();
+          },
         }),
       } as unknown as DbClient;
 
-      const memberService = new MemberService({
-        dbClient: mockMemberDb,
-        auditHook,
-      });
-
+      const memberService = new MemberService({ dbClient: mockDb });
       const ctx = makeContext("admin", "org_alpha", "usr_admin_1");
       await memberService.updateMemberRole(ctx, "org_alpha", "mem_2", "scientist");
 
+      expect(updatedRole).toBe("scientist");
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("member.role_changed");
       expect(insertedAudit!.actorId).toBe("usr_admin_1");
@@ -362,19 +385,9 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       });
     });
 
-    it("19. member removal persists member.removed audit event", async () => {
+    it("19. member removal persists member.removed audit event atomically", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      const mockAuditDb = {
-        insert: () => ({
-          values: (vals: Record<string, unknown>) => {
-            insertedAudit = vals;
-            return Promise.resolve();
-          },
-        }),
-      } as unknown as DbClient;
-
-      const auditService = new AuditService({ dbClient: mockAuditDb });
-      const auditHook = createMemberAuditHook(auditService);
+      let deletedMember = false;
 
       const targetMember = {
         id: "mem_3",
@@ -383,25 +396,34 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         role: "scientist",
       };
 
-      const mockMemberDb = {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([targetMember]),
           }),
         }),
         delete: () => ({
-          where: () => Promise.resolve(),
+          where: () => {
+            deletedMember = true;
+            return Promise.resolve();
+          },
+        }),
+        insert: (table: unknown) => ({
+          values: (vals: Record<string, unknown>) => {
+            if (table === auditEvents) {
+              insertedAudit = vals;
+            }
+            return Promise.resolve();
+          },
         }),
       } as unknown as DbClient;
 
-      const memberService = new MemberService({
-        dbClient: mockMemberDb,
-        auditHook,
-      });
-
+      const memberService = new MemberService({ dbClient: mockDb });
       const ctx = makeContext("owner", "org_alpha", "usr_owner");
       await memberService.removeMember(ctx, "org_alpha", "mem_3");
 
+      expect(deletedMember).toBe(true);
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("member.removed");
       expect(insertedAudit!.actorId).toBe("usr_owner");
@@ -411,61 +433,46 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       });
     });
 
-    it("20. invitation creation persists user.invited audit event", async () => {
+    it("20. invitation creation persists user.invited audit event atomically", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      const mockAuditDb = {
-        insert: () => ({
-          values: (vals: Record<string, unknown>) => {
-            insertedAudit = vals;
-            return Promise.resolve();
-          },
-        }),
-      } as unknown as DbClient;
+      let insertedInv: Record<string, unknown> | null = null;
 
-      const auditService = new AuditService({ dbClient: mockAuditDb });
-      const auditHook = createInvitationAuditHook(auditService);
-
-      const mockInvDb = {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]), // no duplicates
           }),
         }),
-        insert: () => ({
-          values: () => Promise.resolve(),
+        insert: (table: unknown) => ({
+          values: (vals: Record<string, unknown>) => {
+            if (table === auditEvents) {
+              insertedAudit = vals;
+            } else if (table === invitation) {
+              insertedInv = vals;
+            }
+            return Promise.resolve();
+          },
         }),
       } as unknown as DbClient;
 
-      const invService = new InvitationService({
-        dbClient: mockInvDb,
-        auditHook,
-      });
-
+      const invService = new InvitationService({ dbClient: mockDb });
       const ctx = makeContext("owner", "org_alpha", "usr_owner");
       const res = await invService.createInvitation(ctx, "org_alpha", {
         email: "invitee@example.com",
         role: "scientist",
       });
 
+      expect(insertedInv).not.toBeNull();
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("user.invited");
       expect(insertedAudit!.resourceId).toBe(res.id);
       expect((insertedAudit!.metadata as Record<string, unknown>).role).toBe("scientist");
     });
 
-    it("21. invitation cancellation persists invitation.canceled audit event", async () => {
+    it("21. invitation cancellation persists invitation.canceled audit event atomically", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      const mockAuditDb = {
-        insert: () => ({
-          values: (vals: Record<string, unknown>) => {
-            insertedAudit = vals;
-            return Promise.resolve();
-          },
-        }),
-      } as unknown as DbClient;
-
-      const auditService = new AuditService({ dbClient: mockAuditDb });
-      const auditHook = createInvitationAuditHook(auditService);
+      let canceled = false;
 
       const existingInv = {
         id: "inv_cancel_target",
@@ -474,7 +481,8 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         status: "pending",
       };
 
-      const mockInvDb = {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([existingInv]),
@@ -482,37 +490,35 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         }),
         update: () => ({
           set: () => ({
-            where: () => Promise.resolve(),
+            where: () => {
+              canceled = true;
+              return Promise.resolve();
+            },
           }),
         }),
-      } as unknown as DbClient;
-
-      const invService = new InvitationService({
-        dbClient: mockInvDb,
-        auditHook,
-      });
-
-      const ctx = makeContext("admin", "org_alpha", "usr_admin");
-      await invService.cancelInvitation(ctx, "org_alpha", "inv_cancel_target");
-
-      expect(insertedAudit).not.toBeNull();
-      expect(insertedAudit!.action).toBe("invitation.canceled");
-      expect(insertedAudit!.resourceId).toBe("inv_cancel_target");
-    });
-
-    it("22. project assignment persists project_member.assigned audit event", async () => {
-      let insertedAudit: Record<string, unknown> | null = null;
-      const mockAuditDb = {
-        insert: () => ({
+        insert: (table: unknown) => ({
           values: (vals: Record<string, unknown>) => {
-            insertedAudit = vals;
+            if (table === auditEvents) {
+              insertedAudit = vals;
+            }
             return Promise.resolve();
           },
         }),
       } as unknown as DbClient;
 
-      const auditService = new AuditService({ dbClient: mockAuditDb });
-      const auditHook = createProjectAuditHook(auditService);
+      const invService = new InvitationService({ dbClient: mockDb });
+      const ctx = makeContext("admin", "org_alpha", "usr_admin");
+      await invService.cancelInvitation(ctx, "org_alpha", "inv_cancel_target");
+
+      expect(canceled).toBe(true);
+      expect(insertedAudit).not.toBeNull();
+      expect(insertedAudit!.action).toBe("invitation.canceled");
+      expect(insertedAudit!.resourceId).toBe("inv_cancel_target");
+    });
+
+    it("22. project assignment persists project_member.assigned audit event atomically", async () => {
+      let insertedAudit: Record<string, unknown> | null = null;
+      let insertedMember: Record<string, unknown> | null = null;
 
       const mockProject = { id: "proj_10", organizationId: "org_alpha" };
       const mockMember = {
@@ -524,7 +530,8 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         userImage: null,
       };
 
-      const mockProjDb = {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => {
             if (table === projects) {
@@ -540,19 +547,23 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
             return { where: () => Promise.resolve([]) };
           },
         }),
-        insert: () => ({
-          values: () => Promise.resolve(),
+        insert: (table: unknown) => ({
+          values: (vals: Record<string, unknown>) => {
+            if (table === auditEvents) {
+              insertedAudit = vals;
+            } else if (table === projectMembers) {
+              insertedMember = vals;
+            }
+            return Promise.resolve();
+          },
         }),
       } as unknown as DbClient;
 
-      const projService = new ProjectPermissionService({
-        dbClient: mockProjDb,
-        auditHook,
-      });
-
+      const projService = new ProjectPermissionService({ dbClient: mockDb });
       const ctx = makeContext("owner", "org_alpha", "usr_owner");
       const assigned = await projService.assignMemberToProject(ctx, "proj_10", "usr_sc");
 
+      expect(insertedMember).not.toBeNull();
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("project_member.assigned");
       expect(insertedAudit!.resourceId).toBe(assigned.id);
@@ -562,24 +573,15 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       });
     });
 
-    it("23. project assignment removal persists project_member.removed audit event", async () => {
+    it("23. project assignment removal persists project_member.removed audit event atomically", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      const mockAuditDb = {
-        insert: () => ({
-          values: (vals: Record<string, unknown>) => {
-            insertedAudit = vals;
-            return Promise.resolve();
-          },
-        }),
-      } as unknown as DbClient;
-
-      const auditService = new AuditService({ dbClient: mockAuditDb });
-      const auditHook = createProjectAuditHook(auditService);
+      let deletedAssignment = false;
 
       const mockProject = { id: "proj_10", organizationId: "org_alpha" };
       const mockAssignment = { id: "pm_target_1" };
 
-      const mockProjDb = {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => ({
             where: () => {
@@ -589,18 +591,26 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
           }),
         }),
         delete: () => ({
-          where: () => Promise.resolve(),
+          where: () => {
+            deletedAssignment = true;
+            return Promise.resolve();
+          },
+        }),
+        insert: (table: unknown) => ({
+          values: (vals: Record<string, unknown>) => {
+            if (table === auditEvents) {
+              insertedAudit = vals;
+            }
+            return Promise.resolve();
+          },
         }),
       } as unknown as DbClient;
 
-      const projService = new ProjectPermissionService({
-        dbClient: mockProjDb,
-        auditHook,
-      });
-
+      const projService = new ProjectPermissionService({ dbClient: mockDb });
       const ctx = makeContext("admin", "org_alpha", "usr_admin");
       await projService.removeMemberFromProject(ctx, "proj_10", "usr_sc");
 
+      expect(deletedAssignment).toBe(true);
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("project_member.removed");
       expect(insertedAudit!.metadata).toEqual({
@@ -609,29 +619,36 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       });
     });
 
-    it("24. failed mutation does not emit audit record", async () => {
-      const auditHook = vi.fn();
+    it("24. failed domain mutation prevents audit event from being recorded", async () => {
+      let auditInserted = false;
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.reject(new Error("Database transaction aborted")),
           }),
         }),
+        insert: (table: unknown) => ({
+          values: () => {
+            if (table === auditEvents) auditInserted = true;
+            return Promise.resolve();
+          },
+        }),
       } as unknown as DbClient;
 
-      const service = new OrganizationService({ dbClient: mockDb, auditHook });
+      const service = new OrganizationService({ dbClient: mockDb });
       const ctx = makeContext("owner", "org_alpha");
 
       await expect(
         service.updateSettings(ctx, "org_alpha", { defaultRetentionDays: 30 })
-      ).rejects.toThrow();
+      ).rejects.toThrow("Database transaction aborted");
 
-      expect(auditHook).not.toHaveBeenCalled();
+      expect(auditInserted).toBe(false);
     });
 
-    it("25. audit persistence failure is surfaced, not silently swallowed", async () => {
-      const failingAuditHook = vi.fn().mockRejectedValue(new Error("Audit DB unreachable"));
+    it("25. audit persistence failure inside transaction aborts domain mutation", async () => {
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
@@ -642,9 +659,13 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         }),
       } as unknown as DbClient;
 
+      const failingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB unreachable")),
+      };
+
       const service = new OrganizationService({
         dbClient: mockDb,
-        auditHook: failingAuditHook,
+        auditService: failingAuditService as unknown as InstanceType<typeof AuditService>,
       });
       const ctx = makeContext("owner", "org_alpha");
 

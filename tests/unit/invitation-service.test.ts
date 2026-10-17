@@ -34,6 +34,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
       it(`owner can invite canonical non-owner role '${targetRole}'`, async () => {
         let insertedValues: Record<string, unknown> | null = null;
         const mockDb = {
+          transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
           select: () => ({
             from: () => ({
               where: () => Promise.resolve([]), // no active duplicate
@@ -69,6 +70,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
 
     it("admin can invite roles up to admin", async () => {
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
@@ -152,6 +154,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([existingPending]),
@@ -180,6 +183,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
 
       let queriedEmail: string | null = null;
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => {
@@ -208,6 +212,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
       // In the database, the query filters for `expiresAt > now`.
       // If previous invitation is expired, the query returns 0 rows.
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]), // no active unexpired invitation
@@ -234,6 +239,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
       // Similarly, query filters for `status = 'pending'`.
       // Canceled/rejected rows do not match, returning 0 rows.
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
@@ -266,6 +272,39 @@ describe("Invitation Application Service Tests (Step F)", () => {
         })
       ).rejects.toThrow(TenantAuthorizationError);
     });
+
+    it("rolls back invitation creation when transactional audit persistence fails", async () => {
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+        select: () => ({
+          from: () => ({
+            where: () => Promise.resolve([]),
+          }),
+        }),
+        insert: () => ({
+          values: () => Promise.resolve(),
+        }),
+      } as unknown as DbClient;
+
+      const failingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
+      };
+
+      const service = new InvitationService({
+        dbClient: mockDb,
+        auditService: failingAuditService as unknown as InstanceType<
+          typeof import("@/server/services/audit-service").AuditService
+        >,
+      });
+      const ctx = makeContext("owner", "org_alpha");
+
+      await expect(
+        service.createInvitation(ctx, "org_alpha", {
+          email: "fail_invitee@example.com",
+          role: "scientist",
+        })
+      ).rejects.toThrow("Audit DB down");
+    });
   });
 
   describe("Cancel Invitation", () => {
@@ -279,6 +318,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
 
       let canceledStatus: string | null = null;
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([targetInv]),
@@ -291,6 +331,9 @@ describe("Invitation Application Service Tests (Step F)", () => {
               where: () => Promise.resolve(),
             };
           },
+        }),
+        insert: () => ({
+          values: () => Promise.resolve(),
         }),
       } as unknown as DbClient;
 
@@ -318,6 +361,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([acceptedInv]),
@@ -335,6 +379,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
 
     it("rejects canceling foreign tenant invitation", async () => {
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]), // not found in this org
@@ -347,6 +392,45 @@ describe("Invitation Application Service Tests (Step F)", () => {
 
       await expect(service.cancelInvitation(ctx, "org_alpha", "inv_foreign")).rejects.toThrow(
         ResourceNotFoundError
+      );
+    });
+
+    it("rolls back invitation cancellation when transactional audit persistence fails", async () => {
+      const targetInv = {
+        id: "inv_123",
+        organizationId: "org_alpha",
+        email: "pending@example.com",
+        status: "pending",
+      };
+
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+        select: () => ({
+          from: () => ({
+            where: () => Promise.resolve([targetInv]),
+          }),
+        }),
+        update: () => ({
+          set: () => ({
+            where: () => Promise.resolve(),
+          }),
+        }),
+      } as unknown as DbClient;
+
+      const failingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
+      };
+
+      const service = new InvitationService({
+        dbClient: mockDb,
+        auditService: failingAuditService as unknown as InstanceType<
+          typeof import("@/server/services/audit-service").AuditService
+        >,
+      });
+      const ctx = makeContext("admin", "org_alpha");
+
+      await expect(service.cancelInvitation(ctx, "org_alpha", "inv_123")).rejects.toThrow(
+        "Audit DB down"
       );
     });
   });

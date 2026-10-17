@@ -230,6 +230,7 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
 
       let insertedValues: Record<string, unknown> | null = null;
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => {
             if (table === projects) {
@@ -287,6 +288,7 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => {
             if (table === projects) {
@@ -332,6 +334,7 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
     it("15. cross-tenant user assignment rejected non-disclosing", async () => {
       const mockProject = { id: "proj_1", organizationId: "org_alpha" };
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => {
             if (table === projects) {
@@ -369,6 +372,7 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => {
             if (table === projects) {
@@ -407,6 +411,7 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
       const existingAssignment = { id: "pm_existing" };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => {
             if (table === projects) {
@@ -440,6 +445,7 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
 
       let deleted = false;
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => ({
             where: () => {
@@ -455,6 +461,9 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
             deleted = true;
             return Promise.resolve();
           },
+        }),
+        insert: () => ({
+          values: () => Promise.resolve(),
         }),
       } as unknown as DbClient;
 
@@ -480,6 +489,7 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
     it("19. foreign assignment removal cannot mutate", async () => {
       const mockProject = { id: "proj_1", organizationId: "org_alpha" };
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => ({
             where: () => {
@@ -497,6 +507,90 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
 
       await expect(service.removeMemberFromProject(ctx, "proj_1", "usr_foreign")).rejects.toThrow(
         ResourceNotFoundError
+      );
+    });
+
+    it("rolls back project assignment when transactional audit persistence fails", async () => {
+      const mockProject = { id: "proj_1", organizationId: "org_alpha" };
+      const mockTargetMember = {
+        id: "mem_sc",
+        userId: "usr_sc",
+        role: "scientist",
+        userName: "Scientist User",
+        userEmail: "sc@example.com",
+        userImage: null,
+      };
+
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+        select: () => ({
+          from: (table: unknown) => {
+            if (table === projects) return { where: () => Promise.resolve([mockProject]) };
+            if (table === member) {
+              return {
+                innerJoin: () => ({
+                  where: () => Promise.resolve([mockTargetMember]),
+                }),
+              };
+            }
+            return { where: () => Promise.resolve([]) };
+          },
+        }),
+        insert: () => ({
+          values: () => Promise.resolve(),
+        }),
+      } as unknown as DbClient;
+
+      const failingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
+      };
+
+      const service = new ProjectPermissionService({
+        dbClient: mockDb,
+        auditService: failingAuditService as unknown as InstanceType<
+          typeof import("@/server/services/audit-service").AuditService
+        >,
+      });
+      const ctx = makeContext("owner", "org_alpha");
+
+      await expect(service.assignMemberToProject(ctx, "proj_1", "usr_sc")).rejects.toThrow(
+        "Audit DB down"
+      );
+    });
+
+    it("rolls back project member removal when transactional audit persistence fails", async () => {
+      const mockProject = { id: "proj_1", organizationId: "org_alpha" };
+      const mockAssignment = { id: "pm_target" };
+
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+        select: () => ({
+          from: (table: unknown) => ({
+            where: () => {
+              if (table === projects) return Promise.resolve([mockProject]);
+              return Promise.resolve([mockAssignment]);
+            },
+          }),
+        }),
+        delete: () => ({
+          where: () => Promise.resolve(),
+        }),
+      } as unknown as DbClient;
+
+      const failingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
+      };
+
+      const service = new ProjectPermissionService({
+        dbClient: mockDb,
+        auditService: failingAuditService as unknown as InstanceType<
+          typeof import("@/server/services/audit-service").AuditService
+        >,
+      });
+      const ctx = makeContext("admin", "org_alpha");
+
+      await expect(service.removeMemberFromProject(ctx, "proj_1", "usr_target")).rejects.toThrow(
+        "Audit DB down"
       );
     });
   });
@@ -598,6 +692,7 @@ describe("Project Permission & Access Enforcement Service Tests (Step G)", () =>
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: (table: unknown) => {
             if (table === projects) {

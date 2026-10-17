@@ -10,6 +10,11 @@ export function createDbClient(connectionString: string = env.DATABASE_URL) {
 
 export type DbClient = ReturnType<typeof createDbClient>;
 
+/**
+ * Universal database executor type compatible with both DbClient and active PgTransactions.
+ */
+export type DatabaseExecutor = Pick<DbClient, "select" | "insert" | "update" | "delete">;
+
 let dbInstance: DbClient | null = null;
 
 export function getDb(): DbClient {

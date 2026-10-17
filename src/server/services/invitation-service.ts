@@ -13,6 +13,7 @@ import {
   ValidationError,
   validateTenantAccess,
 } from "../authorization";
+import { AuditService } from "./audit-service";
 
 /**
  * Audit Hook Point Event Definitions for Invitations (Step F)
@@ -76,6 +77,7 @@ export interface InvitationDTO {
 
 export interface InvitationServiceOptions {
   dbClient?: DbClient;
+  auditService?: AuditService;
   auditHook?: InvitationAuditHookHandler;
   deliveryAdapter?: InvitationDeliveryAdapter;
   /**
@@ -100,15 +102,18 @@ export interface InvitationServiceOptions {
  * - Owner invitation is rejected in Phase 1 (no improvised ownership-transfer).
  * - Queries are strictly scoped to TenantContext.organizationId.
  * - Delivery boundary does not make external network or email provider calls.
+ * - Invitation creation and cancellation execute atomically with audit persistence in a single transaction.
  */
 export class InvitationService {
   private readonly db: DbClient;
+  private readonly auditService: AuditService;
   private readonly auditHook?: InvitationAuditHookHandler;
   private readonly deliveryAdapter?: InvitationDeliveryAdapter;
   private readonly expirationMs: number;
 
   constructor(options: InvitationServiceOptions = {}) {
     this.db = options.dbClient ?? getDb();
+    this.auditService = options.auditService ?? new AuditService({ dbClient: this.db });
     this.auditHook = options.auditHook;
     this.deliveryAdapter = options.deliveryAdapter;
     this.expirationMs = options.expirationMs ?? 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -201,80 +206,96 @@ export class InvitationService {
 
     const now = new Date();
 
-    // Active duplicate check:
-    // Look for existing pending invitation in this org where expiresAt > now
-    const activeInvitations = await this.db
-      .select({
-        id: invitation.id,
-        email: invitation.email,
-        status: invitation.status,
-        expiresAt: invitation.expiresAt,
-      })
-      .from(invitation)
-      .where(
-        and(
-          eq(invitation.organizationId, context.organizationId),
-          eq(invitation.email, normalizedEmail),
-          eq(invitation.status, "pending"),
-          gt(invitation.expiresAt, now)
-        )
-      );
+    return await this.db.transaction(async (tx) => {
+      // Active duplicate check:
+      // Look for existing pending invitation in this org where expiresAt > now
+      const activeInvitations = await tx
+        .select({
+          id: invitation.id,
+          email: invitation.email,
+          status: invitation.status,
+          expiresAt: invitation.expiresAt,
+        })
+        .from(invitation)
+        .where(
+          and(
+            eq(invitation.organizationId, context.organizationId),
+            eq(invitation.email, normalizedEmail),
+            eq(invitation.status, "pending"),
+            gt(invitation.expiresAt, now)
+          )
+        );
 
-    if (activeInvitations.length > 0) {
-      throw new ConflictError(`An active invitation already exists for '${normalizedEmail}'`);
-    }
+      if (activeInvitations.length > 0) {
+        throw new ConflictError(`An active invitation already exists for '${normalizedEmail}'`);
+      }
 
-    const invitationId = `inv_${randomUUID()}`;
-    const expiresAt = new Date(now.getTime() + this.expirationMs);
+      const invitationId = `inv_${randomUUID()}`;
+      const expiresAt = new Date(now.getTime() + this.expirationMs);
 
-    const newInvitationData = {
-      id: invitationId,
-      organizationId: context.organizationId,
-      email: normalizedEmail,
-      role,
-      status: "pending",
-      expiresAt,
-      createdAt: now,
-      inviterId: context.userId,
-    };
-
-    await this.db.insert(invitation).values(newInvitationData);
-
-    // Call delivery boundary (recording/no-op; never sends real external email)
-    if (this.deliveryAdapter) {
-      await this.deliveryAdapter.recordInvitation({
-        invitationId,
+      const newInvitationData = {
+        id: invitationId,
         organizationId: context.organizationId,
         email: normalizedEmail,
         role,
+        status: "pending" as const,
         expiresAt,
-      });
-    }
+        createdAt: now,
+        inviterId: context.userId,
+      };
 
-    // Step H Audit Hook Point
-    if (this.auditHook) {
-      await this.auditHook({
-        eventType: "user.invited",
-        organizationId: context.organizationId,
-        actorId: context.userId,
-        invitationId,
-        email: normalizedEmail,
-        role,
-        expiresAt,
+      await tx.insert(invitation).values(newInvitationData);
+
+      // Step H Transactional Audit Persistence:
+      // Executed using the same transaction (tx) to ensure atomicity.
+      await this.auditService.recordUserAuditEvent({
+        db: tx,
+        context,
+        action: "user.invited",
+        resourceType: "invitation",
+        resourceId: invitationId,
+        metadata: {
+          role,
+          expiresAt: expiresAt.toISOString(),
+        },
         timestamp: now,
       });
-    }
 
-    return {
-      id: invitationId,
-      organizationId: context.organizationId,
-      email: normalizedEmail,
-      role,
-      status: "pending",
-      expiresAt,
-      createdAt: now,
-      inviterId: context.userId,
-    };
+      // Call delivery boundary (recording/no-op; never sends real external email)
+      if (this.deliveryAdapter) {
+        await this.deliveryAdapter.recordInvitation({
+          invitationId,
+          organizationId: context.organizationId,
+          email: normalizedEmail,
+          role,
+          expiresAt,
+        });
+      }
+
+      if (this.auditHook) {
+        await this.auditHook({
+          eventType: "user.invited",
+          organizationId: context.organizationId,
+          actorId: context.userId,
+          invitationId,
+          email: normalizedEmail,
+          role,
+          expiresAt,
+          timestamp: now,
+        });
+      }
+
+      return {
+        id: invitationId,
+        organizationId: context.organizationId,
+        email: normalizedEmail,
+        role,
+        status: "pending",
+        expiresAt,
+        createdAt: now,
+        inviterId: context.userId,
+      };
+    });
   }
 
   /**
@@ -289,52 +310,65 @@ export class InvitationService {
     validateTenantAccess(context, targetOrganizationId);
     assertOrgAdmin(context);
 
-    const rows = await this.db
-      .select({
-        id: invitation.id,
-        organizationId: invitation.organizationId,
-        email: invitation.email,
-        status: invitation.status,
-      })
-      .from(invitation)
-      .where(
-        and(
-          eq(invitation.id, targetInvitationId),
-          eq(invitation.organizationId, context.organizationId)
-        )
-      );
+    return await this.db.transaction(async (tx) => {
+      const rows = await tx
+        .select({
+          id: invitation.id,
+          organizationId: invitation.organizationId,
+          email: invitation.email,
+          status: invitation.status,
+        })
+        .from(invitation)
+        .where(
+          and(
+            eq(invitation.id, targetInvitationId),
+            eq(invitation.organizationId, context.organizationId)
+          )
+        );
 
-    const target = rows[0];
-    if (!target) {
-      throw new ResourceNotFoundError("Invitation not found in organization");
-    }
+      const target = rows[0];
+      if (!target) {
+        throw new ResourceNotFoundError("Invitation not found in organization");
+      }
 
-    if (target.status !== "pending") {
-      throw new ConflictError(`Cannot cancel invitation in '${target.status}' status`);
-    }
+      if (target.status !== "pending") {
+        throw new ConflictError(`Cannot cancel invitation in '${target.status}' status`);
+      }
 
-    await this.db
-      .update(invitation)
-      .set({ status: "canceled" })
-      .where(
-        and(
-          eq(invitation.id, targetInvitationId),
-          eq(invitation.organizationId, context.organizationId)
-        )
-      );
+      await tx
+        .update(invitation)
+        .set({ status: "canceled" })
+        .where(
+          and(
+            eq(invitation.id, targetInvitationId),
+            eq(invitation.organizationId, context.organizationId)
+          )
+        );
 
-    const now = new Date();
+      const now = new Date();
 
-    // Step H Audit Hook Point
-    if (this.auditHook) {
-      await this.auditHook({
-        eventType: "invitation.canceled",
-        organizationId: context.organizationId,
-        actorId: context.userId,
-        invitationId: target.id,
-        email: target.email,
+      // Step H Transactional Audit Persistence:
+      // Executed using the same transaction (tx) to ensure atomicity.
+      await this.auditService.recordUserAuditEvent({
+        db: tx,
+        context,
+        action: "invitation.canceled",
+        resourceType: "invitation",
+        resourceId: target.id,
+        metadata: {},
         timestamp: now,
       });
-    }
+
+      if (this.auditHook) {
+        await this.auditHook({
+          eventType: "invitation.canceled",
+          organizationId: context.organizationId,
+          actorId: context.userId,
+          invitationId: target.id,
+          email: target.email,
+          timestamp: now,
+        });
+      }
+    });
   }
 }

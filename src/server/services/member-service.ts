@@ -10,6 +10,7 @@ import {
   ValidationError,
   validateTenantAccess,
 } from "../authorization";
+import { AuditService } from "./audit-service";
 
 /**
  * Audit Hook Point Event Definitions for Membership Actions (Step F)
@@ -54,6 +55,7 @@ export interface MemberDTO {
 
 export interface MemberServiceOptions {
   dbClient?: DbClient;
+  auditService?: AuditService;
   auditHook?: MemberAuditHookHandler;
 }
 
@@ -71,13 +73,16 @@ export interface MemberServiceOptions {
  * - Non-admin roles (bioinformatician, scientist, viewer) cannot mutate membership.
  * - Ownership transfer / owner self-removal is rejected in Phase 1 (no ownerless orgs).
  * - Queries are strictly scoped to TenantContext.organizationId.
+ * - Role updates and member removals execute atomically with audit persistence in a single transaction.
  */
 export class MemberService {
   private readonly db: DbClient;
+  private readonly auditService: AuditService;
   private readonly auditHook?: MemberAuditHookHandler;
 
   constructor(options: MemberServiceOptions = {}) {
     this.db = options.dbClient ?? getDb();
+    this.auditService = options.auditService ?? new AuditService({ dbClient: this.db });
     this.auditHook = options.auditHook;
   }
 
@@ -143,86 +148,107 @@ export class MemberService {
     }
     const targetRole = newRole as OrganizationRole;
 
-    // Retrieve target member strictly scoped by organizationId
-    const rows = await this.db
-      .select({
-        id: member.id,
-        organizationId: member.organizationId,
-        userId: member.userId,
-        role: member.role,
-        createdAt: member.createdAt,
-        userName: user.name,
-        userEmail: user.email,
-        userImage: user.image,
-      })
-      .from(member)
-      .innerJoin(user, eq(member.userId, user.id))
-      .where(and(eq(member.id, targetMemberId), eq(member.organizationId, context.organizationId)));
+    return await this.db.transaction(async (tx) => {
+      // Retrieve target member strictly scoped by organizationId
+      const rows = await tx
+        .select({
+          id: member.id,
+          organizationId: member.organizationId,
+          userId: member.userId,
+          role: member.role,
+          createdAt: member.createdAt,
+          userName: user.name,
+          userEmail: user.email,
+          userImage: user.image,
+        })
+        .from(member)
+        .innerJoin(user, eq(member.userId, user.id))
+        .where(
+          and(eq(member.id, targetMemberId), eq(member.organizationId, context.organizationId))
+        );
 
-    const targetMember = rows[0];
-    if (!targetMember) {
-      throw new ResourceNotFoundError("Member not found in organization");
-    }
+      const targetMember = rows[0];
+      if (!targetMember) {
+        throw new ResourceNotFoundError("Member not found in organization");
+      }
 
-    const currentTargetRole = targetMember.role as OrganizationRole;
+      const currentTargetRole = targetMember.role as OrganizationRole;
 
-    // Safety Guard 1: Admin cannot promote anyone to Owner
-    if (context.role === "admin" && targetRole === "owner") {
-      throw new TenantAuthorizationError("Admins cannot assign the owner role");
-    }
+      // Safety Guard 1: Admin cannot promote anyone to Owner
+      if (context.role === "admin" && targetRole === "owner") {
+        throw new TenantAuthorizationError("Admins cannot assign the owner role");
+      }
 
-    // Safety Guard 2: Admin cannot modify an Owner
-    if (context.role === "admin" && currentTargetRole === "owner") {
-      throw new TenantAuthorizationError("Admins cannot modify an owner's role");
-    }
+      // Safety Guard 2: Admin cannot modify an Owner
+      if (context.role === "admin" && currentTargetRole === "owner") {
+        throw new TenantAuthorizationError("Admins cannot modify an owner's role");
+      }
 
-    // Safety Guard 3: Ownership transfer semantics are not defined for Phase 1
-    // If target is owner and role is changed, or target is made owner, reject fail-closed
-    if (currentTargetRole === "owner" && targetRole !== "owner") {
-      throw new TenantAuthorizationError(
-        "Owner demotion or ownership transfer is not supported in Phase 1"
-      );
-    }
-    if (currentTargetRole !== "owner" && targetRole === "owner") {
-      throw new TenantAuthorizationError(
-        "Ownership assignment is not supported via member role update in Phase 1"
-      );
-    }
+      // Safety Guard 3: Ownership transfer semantics are not defined for Phase 1
+      // If target is owner and role is changed, or target is made owner, reject fail-closed
+      if (currentTargetRole === "owner" && targetRole !== "owner") {
+        throw new TenantAuthorizationError(
+          "Owner demotion or ownership transfer is not supported in Phase 1"
+        );
+      }
+      if (currentTargetRole !== "owner" && targetRole === "owner") {
+        throw new TenantAuthorizationError(
+          "Ownership assignment is not supported via member role update in Phase 1"
+        );
+      }
 
-    // Apply update
-    await this.db
-      .update(member)
-      .set({ role: targetRole })
-      .where(and(eq(member.id, targetMemberId), eq(member.organizationId, context.organizationId)));
+      // Apply update using tx
+      await tx
+        .update(member)
+        .set({ role: targetRole })
+        .where(
+          and(eq(member.id, targetMemberId), eq(member.organizationId, context.organizationId))
+        );
 
-    const now = new Date();
+      const now = new Date();
 
-    // Step H Audit Hook Point
-    if (this.auditHook) {
-      await this.auditHook({
-        eventType: "member.role.changed",
-        organizationId: context.organizationId,
-        actorId: context.userId,
-        targetMemberId: targetMember.id,
-        targetUserId: targetMember.userId,
-        oldRole: currentTargetRole,
-        newRole: targetRole,
+      // Step H Transactional Audit Persistence:
+      // Executed using the same transaction (tx) to ensure atomicity.
+      await this.auditService.recordUserAuditEvent({
+        db: tx,
+        context,
+        action: "member.role_changed",
+        resourceType: "member",
+        resourceId: targetMember.id,
+        metadata: {
+          targetUserId: targetMember.userId,
+          previousRole: currentTargetRole,
+          newRole: targetRole,
+        },
         timestamp: now,
       });
-    }
 
-    return {
-      id: targetMember.id,
-      organizationId: targetMember.organizationId,
-      userId: targetMember.userId,
-      role: targetRole,
-      createdAt: targetMember.createdAt,
-      user: {
-        name: targetMember.userName,
-        email: targetMember.userEmail,
-        image: targetMember.userImage,
-      },
-    };
+      if (this.auditHook) {
+        await this.auditHook({
+          eventType: "member.role.changed",
+          organizationId: context.organizationId,
+          actorId: context.userId,
+          targetMemberId: targetMember.id,
+          targetUserId: targetMember.userId,
+          oldRole: currentTargetRole,
+          newRole: targetRole,
+          timestamp: now,
+        });
+      }
+
+      return {
+        id: targetMember.id,
+        organizationId: targetMember.organizationId,
+        userId: targetMember.userId,
+        role: targetRole,
+        createdAt: targetMember.createdAt,
+        user: {
+          name: targetMember.userName,
+          email: targetMember.userEmail,
+          image: targetMember.userImage,
+        },
+      };
+    });
   }
 
   /**
@@ -240,54 +266,74 @@ export class MemberService {
     validateTenantAccess(context, targetOrganizationId);
     assertOrgAdmin(context);
 
-    // Retrieve target member strictly scoped by organizationId
-    const rows = await this.db
-      .select({
-        id: member.id,
-        organizationId: member.organizationId,
-        userId: member.userId,
-        role: member.role,
-      })
-      .from(member)
-      .where(and(eq(member.id, targetMemberId), eq(member.organizationId, context.organizationId)));
+    return await this.db.transaction(async (tx) => {
+      // Retrieve target member strictly scoped by organizationId
+      const rows = await tx
+        .select({
+          id: member.id,
+          organizationId: member.organizationId,
+          userId: member.userId,
+          role: member.role,
+        })
+        .from(member)
+        .where(
+          and(eq(member.id, targetMemberId), eq(member.organizationId, context.organizationId))
+        );
 
-    const target = rows[0];
-    if (!target) {
-      throw new ResourceNotFoundError("Member not found in organization");
-    }
+      const target = rows[0];
+      if (!target) {
+        throw new ResourceNotFoundError("Member not found in organization");
+      }
 
-    const targetRole = target.role as OrganizationRole;
+      const targetRole = target.role as OrganizationRole;
 
-    // Safety Guard 1: Admin cannot remove an Owner
-    if (context.role === "admin" && targetRole === "owner") {
-      throw new TenantAuthorizationError("Admins cannot remove an owner");
-    }
+      // Safety Guard 1: Admin cannot remove an Owner
+      if (context.role === "admin" && targetRole === "owner") {
+        throw new TenantAuthorizationError("Admins cannot remove an owner");
+      }
 
-    // Safety Guard 2: An organization cannot be left ownerless
-    if (targetRole === "owner") {
-      throw new TenantAuthorizationError(
-        "Owners cannot be removed from an organization in Phase 1"
-      );
-    }
+      // Safety Guard 2: An organization cannot be left ownerless
+      if (targetRole === "owner") {
+        throw new TenantAuthorizationError(
+          "Owners cannot be removed from an organization in Phase 1"
+        );
+      }
 
-    // Delete membership
-    await this.db
-      .delete(member)
-      .where(and(eq(member.id, targetMemberId), eq(member.organizationId, context.organizationId)));
+      // Delete membership using tx
+      await tx
+        .delete(member)
+        .where(
+          and(eq(member.id, targetMemberId), eq(member.organizationId, context.organizationId))
+        );
 
-    const now = new Date();
+      const now = new Date();
 
-    // Step H Audit Hook Point
-    if (this.auditHook) {
-      await this.auditHook({
-        eventType: "member.removed",
-        organizationId: context.organizationId,
-        actorId: context.userId,
-        targetMemberId: target.id,
-        targetUserId: target.userId,
-        role: targetRole,
+      // Step H Transactional Audit Persistence:
+      // Executed using the same transaction (tx) to ensure atomicity.
+      await this.auditService.recordUserAuditEvent({
+        db: tx,
+        context,
+        action: "member.removed",
+        resourceType: "member",
+        resourceId: target.id,
+        metadata: {
+          targetUserId: target.userId,
+          role: targetRole,
+        },
         timestamp: now,
       });
-    }
+
+      if (this.auditHook) {
+        await this.auditHook({
+          eventType: "member.removed",
+          organizationId: context.organizationId,
+          actorId: context.userId,
+          targetMemberId: target.id,
+          targetUserId: target.userId,
+          role: targetRole,
+          timestamp: now,
+        });
+      }
+    });
   }
 }

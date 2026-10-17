@@ -7,23 +7,22 @@ import { assertOwner } from "../authorization/guards";
 import { validateTenantAccess } from "../authorization";
 import { hashIpAddress, sanitizeAuditMetadata } from "./audit-privacy";
 
+import type { DatabaseExecutor } from "../database/client";
+
 /**
- * Step H Audit Event Persistence Input
+ * Step H User Audit Event Persistence Input
+ *
+ * organizationId, actorId, and actorType are strictly derived from context.
+ * No arbitrary/caller-supplied organization or actor override is permitted.
  */
-export interface RecordAuditEventInput {
+export interface RecordUserAuditEventInput {
   /**
-   * Optional TenantContext for authenticated user actions.
-   * If provided, organizationId, actorId, and actorType are strictly derived from context.
+   * DatabaseExecutor (transaction tx or DbClient).
+   * When provided from an active db.transaction, guarantees atomic persistence
+   * with the underlying domain mutation.
    */
-  context?: TenantContext;
-  /**
-   * For explicit non-user / system actions (when context is not present).
-   */
-  explicitScope?: {
-    organizationId: string;
-    actorType: string;
-    actorId: string;
-  };
+  db?: DatabaseExecutor;
+  context: TenantContext;
   action: string;
   resourceType: string;
   resourceId: string;
@@ -60,14 +59,16 @@ export interface AuditServiceOptions {
  * Audit Application Service (Phase 1 Identity, Tenancy & Governance)
  *
  * Master Design & Architecture Invariants:
- * 1. Append-Only: Exposes only recordAuditEvent (INSERT) and listAuditEvents (SELECT).
+ * 1. Append-Only: Exposes only recordUserAuditEvent (INSERT) and listAuditEvents (SELECT).
  *    No UPDATE or DELETE methods exist.
- * 2. Actor Derivation: For authenticated actions, organizationId, actorId, and actorType ("user")
- *    are strictly derived from TenantContext. Never accepted from untrusted request payloads.
- * 3. Privacy & RUO Invariants:
+ * 2. Actor Derivation: organizationId, actorId, and actorType ("user") are strictly
+ *    derived from TenantContext. Never accepted from untrusted request payloads.
+ * 3. Atomic Consistency: Accepts a DatabaseExecutor so that security-sensitive mutations
+ *    and audit event persistence execute within the exact same database transaction.
+ * 4. Privacy & RUO Invariants:
  *    - Never logs raw IP addresses (hashes via keyed HMAC).
  *    - Defensive sanitization rejects passwords, secrets, tokens, matrices, gene vectors, and PHI.
- * 4. Read Authorization:
+ * 5. Read Authorization:
  *    - Owner-only: Only organization owners may read audit logs.
  *    - All queries are strictly scoped by TenantContext.organizationId.
  */
@@ -79,25 +80,13 @@ export class AuditService {
   }
 
   /**
-   * Persists an immutable audit event to the database.
+   * Persists an immutable user audit event to the database.
    * Append-only: INSERT ONLY.
    */
-  async recordAuditEvent(input: RecordAuditEventInput): Promise<AuditEventDTO> {
-    let orgId: string;
-    let actorType: string;
-    let actorId: string;
-
-    if (input.context) {
-      orgId = input.context.organizationId;
-      actorType = "user";
-      actorId = input.context.userId;
-    } else if (input.explicitScope) {
-      orgId = input.explicitScope.organizationId;
-      actorType = input.explicitScope.actorType;
-      actorId = input.explicitScope.actorId;
-    } else {
-      throw new Error("Audit event requires either TenantContext or explicitScope");
-    }
+  async recordUserAuditEvent(input: RecordUserAuditEventInput): Promise<AuditEventDTO> {
+    const orgId = input.context.organizationId;
+    const actorType = "user";
+    const actorId = input.context.userId;
 
     // Privacy & Sanitization
     const sanitizedMetadata = sanitizeAuditMetadata(input.metadata);
@@ -119,8 +108,8 @@ export class AuditService {
       createdAt,
     };
 
-    // Execute INSERT
-    await this.db.insert(auditEvents).values(eventRecord);
+    const executor: DatabaseExecutor = input.db ?? this.db;
+    await executor.insert(auditEvents).values(eventRecord);
 
     return {
       ...eventRecord,

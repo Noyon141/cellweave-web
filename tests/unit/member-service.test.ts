@@ -119,6 +119,7 @@ describe("Member Application Service Tests (Step F)", () => {
         };
 
         const mockDb = {
+          transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
           select: () => ({
             from: () => ({
               innerJoin: () => ({
@@ -130,6 +131,9 @@ describe("Member Application Service Tests (Step F)", () => {
             set: () => ({
               where: () => Promise.resolve(),
             }),
+          }),
+          insert: () => ({
+            values: () => Promise.resolve(),
           }),
         } as unknown as DbClient;
 
@@ -153,6 +157,7 @@ describe("Member Application Service Tests (Step F)", () => {
         };
 
         const mockDb = {
+          transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
           select: () => ({
             from: () => ({
               innerJoin: () => ({
@@ -164,6 +169,9 @@ describe("Member Application Service Tests (Step F)", () => {
             set: () => ({
               where: () => Promise.resolve(),
             }),
+          }),
+          insert: () => ({
+            values: () => Promise.resolve(),
           }),
         } as unknown as DbClient;
 
@@ -188,6 +196,7 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -218,6 +227,7 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -244,6 +254,7 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([ownerMember]),
@@ -268,6 +279,7 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([ownerMember]),
@@ -303,6 +315,7 @@ describe("Member Application Service Tests (Step F)", () => {
 
     it("foreign-tenant member mutation is rejected and non-disclosing", async () => {
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -340,6 +353,7 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -355,6 +369,9 @@ describe("Member Application Service Tests (Step F)", () => {
         }),
         delete: () => ({
           where: () => Promise.resolve(),
+        }),
+        insert: () => ({
+          values: () => Promise.resolve(),
         }),
       } as unknown as DbClient;
 
@@ -380,6 +397,88 @@ describe("Member Application Service Tests (Step F)", () => {
           targetMemberId: "mem_2",
           role: "scientist",
         })
+      );
+    });
+
+    it("rolls back member role change when transactional audit persistence fails", async () => {
+      const targetMember = {
+        id: "mem_fail",
+        organizationId: "org_alpha",
+        userId: "usr_fail",
+        role: "viewer",
+        createdAt: new Date(),
+        userName: "Fail User",
+        userEmail: "fail@example.com",
+        userImage: null,
+      };
+
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+        select: () => ({
+          from: () => ({
+            innerJoin: () => ({
+              where: () => Promise.resolve([targetMember]),
+            }),
+          }),
+        }),
+        update: () => ({
+          set: () => ({
+            where: () => Promise.resolve(),
+          }),
+        }),
+      } as unknown as DbClient;
+
+      const failingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
+      };
+
+      const service = new MemberService({
+        dbClient: mockDb,
+        auditService: failingAuditService as unknown as InstanceType<
+          typeof import("@/server/services/audit-service").AuditService
+        >,
+      });
+      const ctx = makeContext("owner", "org_alpha");
+
+      await expect(
+        service.updateMemberRole(ctx, "org_alpha", "mem_fail", "scientist")
+      ).rejects.toThrow("Audit DB down");
+    });
+
+    it("rolls back member removal when transactional audit persistence fails", async () => {
+      const targetMember = {
+        id: "mem_fail",
+        organizationId: "org_alpha",
+        userId: "usr_fail",
+        role: "scientist",
+      };
+
+      const mockDb = {
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+        select: () => ({
+          from: () => ({
+            where: () => Promise.resolve([targetMember]),
+          }),
+        }),
+        delete: () => ({
+          where: () => Promise.resolve(),
+        }),
+      } as unknown as DbClient;
+
+      const failingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
+      };
+
+      const service = new MemberService({
+        dbClient: mockDb,
+        auditService: failingAuditService as unknown as InstanceType<
+          typeof import("@/server/services/audit-service").AuditService
+        >,
+      });
+      const ctx = makeContext("owner", "org_alpha");
+
+      await expect(service.removeMember(ctx, "org_alpha", "mem_fail")).rejects.toThrow(
+        "Audit DB down"
       );
     });
   });

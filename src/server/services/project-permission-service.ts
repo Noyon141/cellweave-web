@@ -11,6 +11,7 @@ import {
   TenantAuthorizationError,
   ValidationError,
 } from "../authorization";
+import { AuditService } from "./audit-service";
 
 /**
  * Step H Audit Hook Point Event Definitions for Project Member Actions
@@ -62,6 +63,7 @@ export interface ProjectMemberDTO {
 
 export interface ProjectPermissionServiceOptions {
   dbClient?: DbClient;
+  auditService?: AuditService;
   auditHook?: ProjectAuditHookHandler;
 }
 
@@ -85,13 +87,16 @@ export interface ProjectPermissionServiceOptions {
  * - Non-existent projects and foreign-tenant projects are non-disclosing (ResourceNotFoundError).
  * - Redundant assignments for Owner/Admin are rejected (they have org-wide access by role).
  * - Target users must have a current active membership in context.organizationId.
+ * - Assignment and removal mutations execute atomically with audit persistence in a single transaction.
  */
 export class ProjectPermissionService {
   private readonly db: DbClient;
+  private readonly auditService: AuditService;
   private readonly auditHook?: ProjectAuditHookHandler;
 
   constructor(options: ProjectPermissionServiceOptions = {}) {
     this.db = options.dbClient ?? getDb();
+    this.auditService = options.auditService ?? new AuditService({ dbClient: this.db });
     this.auditHook = options.auditHook;
   }
 
@@ -183,107 +188,125 @@ export class ProjectPermissionService {
   ): Promise<ProjectMemberDTO> {
     assertOrgAdmin(context);
 
-    // 1. Verify project exists within tenant
-    const projectRows = await this.db
-      .select({
-        id: projects.id,
-        organizationId: projects.organizationId,
-      })
-      .from(projects)
-      .where(and(eq(projects.id, projectId), eq(projects.organizationId, context.organizationId)));
+    return await this.db.transaction(async (tx) => {
+      // 1. Verify project exists within tenant
+      const projectRows = await tx
+        .select({
+          id: projects.id,
+          organizationId: projects.organizationId,
+        })
+        .from(projects)
+        .where(
+          and(eq(projects.id, projectId), eq(projects.organizationId, context.organizationId))
+        );
 
-    const projectRecord = projectRows[0];
-    if (!projectRecord) {
-      throw new ResourceNotFoundError("Project not found");
-    }
+      const projectRecord = projectRows[0];
+      if (!projectRecord) {
+        throw new ResourceNotFoundError("Project not found");
+      }
 
-    // 2. Verify target user has active membership in the active organization
-    const memberRows = await this.db
-      .select({
-        id: member.id,
-        userId: member.userId,
-        role: member.role,
-        userName: user.name,
-        userEmail: user.email,
-        userImage: user.image,
-      })
-      .from(member)
-      .innerJoin(user, eq(member.userId, user.id))
-      .where(
-        and(eq(member.organizationId, context.organizationId), eq(member.userId, targetUserId))
-      );
+      // 2. Verify target user has active membership in the active organization
+      const memberRows = await tx
+        .select({
+          id: member.id,
+          userId: member.userId,
+          role: member.role,
+          userName: user.name,
+          userEmail: user.email,
+          userImage: user.image,
+        })
+        .from(member)
+        .innerJoin(user, eq(member.userId, user.id))
+        .where(
+          and(eq(member.organizationId, context.organizationId), eq(member.userId, targetUserId))
+        );
 
-    const targetMember = memberRows[0];
-    if (!targetMember) {
-      // User is not a member of this tenant
-      throw new ResourceNotFoundError("Target user is not a member of this organization");
-    }
+      const targetMember = memberRows[0];
+      if (!targetMember) {
+        // User is not a member of this tenant
+        throw new ResourceNotFoundError("Target user is not a member of this organization");
+      }
 
-    const targetOrgRole = targetMember.role as OrganizationRole;
+      const targetOrgRole = targetMember.role as OrganizationRole;
 
-    // 3. Invariant: Owner/Admin already possess organization-wide access
-    if (targetOrgRole === "owner" || targetOrgRole === "admin") {
-      throw new ValidationError(
-        `Users with organization role '${targetOrgRole}' have organization-wide project access by role and cannot be assigned to individual projects`
-      );
-    }
+      // 3. Invariant: Owner/Admin already possess organization-wide access
+      if (targetOrgRole === "owner" || targetOrgRole === "admin") {
+        throw new ValidationError(
+          `Users with organization role '${targetOrgRole}' have organization-wide project access by role and cannot be assigned to individual projects`
+        );
+      }
 
-    // 4. Duplicate assignment check
-    const existingAssignment = await this.db
-      .select({
-        id: projectMembers.id,
-      })
-      .from(projectMembers)
-      .where(
-        and(
-          eq(projectMembers.projectId, projectId),
-          eq(projectMembers.organizationId, context.organizationId),
-          eq(projectMembers.userId, targetUserId)
-        )
-      );
+      // 4. Duplicate assignment check
+      const existingAssignment = await tx
+        .select({
+          id: projectMembers.id,
+        })
+        .from(projectMembers)
+        .where(
+          and(
+            eq(projectMembers.projectId, projectId),
+            eq(projectMembers.organizationId, context.organizationId),
+            eq(projectMembers.userId, targetUserId)
+          )
+        );
 
-    if (existingAssignment.length > 0) {
-      throw new ConflictError("User is already assigned to this project");
-    }
+      if (existingAssignment.length > 0) {
+        throw new ConflictError("User is already assigned to this project");
+      }
 
-    // 5. Insert assignment
-    const assignmentId = `pm_${randomUUID()}`;
-    const now = new Date();
+      // 5. Insert assignment using tx
+      const assignmentId = `pm_${randomUUID()}`;
+      const now = new Date();
 
-    await this.db.insert(projectMembers).values({
-      id: assignmentId,
-      organizationId: context.organizationId,
-      projectId,
-      userId: targetUserId,
-      createdAt: now,
-    });
-
-    // Step H Audit Hook Point
-    if (this.auditHook) {
-      await this.auditHook({
-        eventType: "project_member.assigned",
+      await tx.insert(projectMembers).values({
+        id: assignmentId,
         organizationId: context.organizationId,
-        actorId: context.userId,
         projectId,
-        targetUserId,
-        projectMemberId: assignmentId,
+        userId: targetUserId,
+        createdAt: now,
+      });
+
+      // Step H Transactional Audit Persistence:
+      // Executed using the same transaction (tx) to ensure atomicity.
+      await this.auditService.recordUserAuditEvent({
+        db: tx,
+        context,
+        action: "project_member.assigned",
+        resourceType: "project_member",
+        resourceId: assignmentId,
+        metadata: {
+          projectId,
+          targetUserId,
+        },
         timestamp: now,
       });
-    }
 
-    return {
-      id: assignmentId,
-      projectId,
-      organizationId: context.organizationId,
-      userId: targetUserId,
-      role: targetOrgRole,
-      assignedAt: now,
-      user: {
-        name: targetMember.userName,
-        email: targetMember.userEmail,
-        image: targetMember.userImage,
-      },
-    };
+      if (this.auditHook) {
+        await this.auditHook({
+          eventType: "project_member.assigned",
+          organizationId: context.organizationId,
+          actorId: context.userId,
+          projectId,
+          targetUserId,
+          projectMemberId: assignmentId,
+          timestamp: now,
+        });
+      }
+
+      return {
+        id: assignmentId,
+        projectId,
+        organizationId: context.organizationId,
+        userId: targetUserId,
+        role: targetOrgRole,
+        assignedAt: now,
+        user: {
+          name: targetMember.userName,
+          email: targetMember.userEmail,
+          image: targetMember.userImage,
+        },
+      };
+    });
   }
 
   /**
@@ -305,60 +328,78 @@ export class ProjectPermissionService {
   ): Promise<void> {
     assertOrgAdmin(context);
 
-    // 1. Verify project exists within tenant
-    const projectRows = await this.db
-      .select({
-        id: projects.id,
-      })
-      .from(projects)
-      .where(and(eq(projects.id, projectId), eq(projects.organizationId, context.organizationId)));
+    return await this.db.transaction(async (tx) => {
+      // 1. Verify project exists within tenant
+      const projectRows = await tx
+        .select({
+          id: projects.id,
+        })
+        .from(projects)
+        .where(
+          and(eq(projects.id, projectId), eq(projects.organizationId, context.organizationId))
+        );
 
-    if (!projectRows[0]) {
-      throw new ResourceNotFoundError("Project not found");
-    }
+      if (!projectRows[0]) {
+        throw new ResourceNotFoundError("Project not found");
+      }
 
-    // 2. Find target assignment
-    const assignmentRows = await this.db
-      .select({
-        id: projectMembers.id,
-      })
-      .from(projectMembers)
-      .where(
-        and(
-          eq(projectMembers.projectId, projectId),
-          eq(projectMembers.organizationId, context.organizationId),
-          eq(projectMembers.userId, targetUserId)
-        )
-      );
+      // 2. Find target assignment
+      const assignmentRows = await tx
+        .select({
+          id: projectMembers.id,
+        })
+        .from(projectMembers)
+        .where(
+          and(
+            eq(projectMembers.projectId, projectId),
+            eq(projectMembers.organizationId, context.organizationId),
+            eq(projectMembers.userId, targetUserId)
+          )
+        );
 
-    const assignment = assignmentRows[0];
-    if (!assignment) {
-      throw new ResourceNotFoundError("Project member assignment not found");
-    }
+      const assignment = assignmentRows[0];
+      if (!assignment) {
+        throw new ResourceNotFoundError("Project member assignment not found");
+      }
 
-    // 3. Delete assignment
-    await this.db
-      .delete(projectMembers)
-      .where(
-        and(
-          eq(projectMembers.id, assignment.id),
-          eq(projectMembers.organizationId, context.organizationId)
-        )
-      );
+      // 3. Delete assignment using tx
+      await tx
+        .delete(projectMembers)
+        .where(
+          and(
+            eq(projectMembers.id, assignment.id),
+            eq(projectMembers.organizationId, context.organizationId)
+          )
+        );
 
-    const now = new Date();
+      const now = new Date();
 
-    // Step H Audit Hook Point
-    if (this.auditHook) {
-      await this.auditHook({
-        eventType: "project_member.removed",
-        organizationId: context.organizationId,
-        actorId: context.userId,
-        projectId,
-        targetUserId,
+      // Step H Transactional Audit Persistence:
+      // Executed using the same transaction (tx) to ensure atomicity.
+      await this.auditService.recordUserAuditEvent({
+        db: tx,
+        context,
+        action: "project_member.removed",
+        resourceType: "project_member",
+        resourceId: `${projectId}:${targetUserId}`,
+        metadata: {
+          projectId,
+          targetUserId,
+        },
         timestamp: now,
       });
-    }
+
+      if (this.auditHook) {
+        await this.auditHook({
+          eventType: "project_member.removed",
+          organizationId: context.organizationId,
+          actorId: context.userId,
+          projectId,
+          targetUserId,
+          timestamp: now,
+        });
+      }
+    });
   }
 
   /**

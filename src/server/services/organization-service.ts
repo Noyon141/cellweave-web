@@ -6,6 +6,7 @@ import { organizationSettings } from "../database/schema/organizations";
 import { organization } from "../database/schema/auth";
 import { assertOrgAdmin } from "../authorization/guards";
 import { ResourceNotFoundError, ValidationError, validateTenantAccess } from "../authorization";
+import { AuditService } from "./audit-service";
 
 /**
  * Audit Hook Point Event Definitions for Phase 1 Step F
@@ -59,6 +60,7 @@ export type UpdateOrganizationSettingsInput = z.infer<typeof updateOrganizationS
 
 export interface OrganizationServiceOptions {
   dbClient?: DbClient;
+  auditService?: AuditService;
   auditHook?: AuditHookHandler;
 }
 
@@ -74,13 +76,16 @@ export interface OrganizationServiceOptions {
  * - Never derive organization identity from URL, query, or body.
  * - Every database query is strictly scoped by TenantContext.organizationId.
  * - updatedBy is derived exclusively from TenantContext.userId.
+ * - Settings mutations and audit event persistence are executed atomically in the same transaction.
  */
 export class OrganizationService {
   private readonly db: DbClient;
+  private readonly auditService: AuditService;
   private readonly auditHook?: AuditHookHandler;
 
   constructor(options: OrganizationServiceOptions = {}) {
     this.db = options.dbClient ?? getDb();
+    this.auditService = options.auditService ?? new AuditService({ dbClient: this.db });
     this.auditHook = options.auditHook;
   }
 
@@ -160,108 +165,126 @@ export class OrganizationService {
     }
     const input = parsed.data;
 
-    // Fetch existing settings if any
-    const existingRows = await this.db
-      .select({
-        organizationId: organizationSettings.organizationId,
-        defaultRetentionDays: organizationSettings.defaultRetentionDays,
-        downloadPermissions: organizationSettings.downloadPermissions,
-        exportPermissions: organizationSettings.exportPermissions,
-        projectVisibility: organizationSettings.projectVisibility,
-        updatedAt: organizationSettings.updatedAt,
-        updatedBy: organizationSettings.updatedBy,
-      })
-      .from(organizationSettings)
-      .where(eq(organizationSettings.organizationId, context.organizationId));
-
-    const existing = existingRows[0] ?? null;
-    const now = new Date();
-
-    let updated: OrganizationSettingsDTO;
-
-    if (!existing) {
-      // Upsert: Create initial settings row
-      const insertData = {
-        organizationId: context.organizationId,
-        defaultRetentionDays: input.defaultRetentionDays ?? null,
-        downloadPermissions: input.downloadPermissions ?? null,
-        exportPermissions: input.exportPermissions ?? null,
-        projectVisibility: input.projectVisibility ?? null,
-        updatedAt: now,
-        updatedBy: context.userId,
-      };
-
-      await this.db.insert(organizationSettings).values(insertData);
-      updated = insertData;
-    } else {
-      // Upsert: Update existing settings row
-      const updateData: {
-        updatedAt: Date;
-        updatedBy: string;
-        defaultRetentionDays?: number | null;
-        downloadPermissions?: string | null;
-        exportPermissions?: string | null;
-        projectVisibility?: string | null;
-      } = {
-        updatedAt: now,
-        updatedBy: context.userId,
-      };
-
-      if (input.defaultRetentionDays !== undefined) {
-        updateData.defaultRetentionDays = input.defaultRetentionDays;
-      }
-      if (input.downloadPermissions !== undefined) {
-        updateData.downloadPermissions = input.downloadPermissions;
-      }
-      if (input.exportPermissions !== undefined) {
-        updateData.exportPermissions = input.exportPermissions;
-      }
-      if (input.projectVisibility !== undefined) {
-        updateData.projectVisibility = input.projectVisibility;
-      }
-
-      await this.db
-        .update(organizationSettings)
-        .set(updateData)
+    return await this.db.transaction(async (tx) => {
+      // Fetch existing settings if any
+      const existingRows = await tx
+        .select({
+          organizationId: organizationSettings.organizationId,
+          defaultRetentionDays: organizationSettings.defaultRetentionDays,
+          downloadPermissions: organizationSettings.downloadPermissions,
+          exportPermissions: organizationSettings.exportPermissions,
+          projectVisibility: organizationSettings.projectVisibility,
+          updatedAt: organizationSettings.updatedAt,
+          updatedBy: organizationSettings.updatedBy,
+        })
+        .from(organizationSettings)
         .where(eq(organizationSettings.organizationId, context.organizationId));
 
-      updated = {
-        organizationId: context.organizationId,
-        defaultRetentionDays:
-          input.defaultRetentionDays !== undefined
-            ? input.defaultRetentionDays
-            : existing.defaultRetentionDays,
-        downloadPermissions:
-          input.downloadPermissions !== undefined
-            ? input.downloadPermissions
-            : existing.downloadPermissions,
-        exportPermissions:
-          input.exportPermissions !== undefined
-            ? input.exportPermissions
-            : existing.exportPermissions,
-        projectVisibility:
-          input.projectVisibility !== undefined
-            ? input.projectVisibility
-            : existing.projectVisibility,
-        updatedAt: now,
-        updatedBy: context.userId,
-      };
-    }
+      const existing = existingRows[0] ?? null;
+      const now = new Date();
 
-    // Step H Audit Hook Point
-    if (this.auditHook) {
-      await this.auditHook({
-        eventType: "org_settings.updated",
-        organizationId: context.organizationId,
-        actorId: context.userId,
+      let updated: OrganizationSettingsDTO;
+
+      if (!existing) {
+        // Upsert: Create initial settings row
+        const insertData = {
+          organizationId: context.organizationId,
+          defaultRetentionDays: input.defaultRetentionDays ?? null,
+          downloadPermissions: input.downloadPermissions ?? null,
+          exportPermissions: input.exportPermissions ?? null,
+          projectVisibility: input.projectVisibility ?? null,
+          updatedAt: now,
+          updatedBy: context.userId,
+        };
+
+        await tx.insert(organizationSettings).values(insertData);
+        updated = insertData;
+      } else {
+        // Upsert: Update existing settings row
+        const updateData: {
+          updatedAt: Date;
+          updatedBy: string;
+          defaultRetentionDays?: number | null;
+          downloadPermissions?: string | null;
+          exportPermissions?: string | null;
+          projectVisibility?: string | null;
+        } = {
+          updatedAt: now,
+          updatedBy: context.userId,
+        };
+
+        if (input.defaultRetentionDays !== undefined) {
+          updateData.defaultRetentionDays = input.defaultRetentionDays;
+        }
+        if (input.downloadPermissions !== undefined) {
+          updateData.downloadPermissions = input.downloadPermissions;
+        }
+        if (input.exportPermissions !== undefined) {
+          updateData.exportPermissions = input.exportPermissions;
+        }
+        if (input.projectVisibility !== undefined) {
+          updateData.projectVisibility = input.projectVisibility;
+        }
+
+        await tx
+          .update(organizationSettings)
+          .set(updateData)
+          .where(eq(organizationSettings.organizationId, context.organizationId));
+
+        updated = {
+          organizationId: context.organizationId,
+          defaultRetentionDays:
+            input.defaultRetentionDays !== undefined
+              ? input.defaultRetentionDays
+              : existing.defaultRetentionDays,
+          downloadPermissions:
+            input.downloadPermissions !== undefined
+              ? input.downloadPermissions
+              : existing.downloadPermissions,
+          exportPermissions:
+            input.exportPermissions !== undefined
+              ? input.exportPermissions
+              : existing.exportPermissions,
+          projectVisibility:
+            input.projectVisibility !== undefined
+              ? input.projectVisibility
+              : existing.projectVisibility,
+          updatedAt: now,
+          updatedBy: context.userId,
+        };
+      }
+
+      // Step H Transactional Audit Persistence:
+      // Executed using the same transaction (tx) to ensure atomicity.
+      await this.auditService.recordUserAuditEvent({
+        db: tx,
+        context,
+        action: "org_settings.updated",
+        resourceType: "organization_settings",
+        resourceId: context.organizationId,
         metadata: {
-          previousSettings: existing,
-          updatedSettings: updated,
+          defaultRetentionDays: updated.defaultRetentionDays,
+          downloadPermissions: updated.downloadPermissions,
+          exportPermissions: updated.exportPermissions,
+          projectVisibility: updated.projectVisibility,
         },
         timestamp: now,
       });
-    }
 
-    return updated;
+      if (this.auditHook) {
+        await this.auditHook({
+          eventType: "org_settings.updated",
+          organizationId: context.organizationId,
+          actorId: context.userId,
+          metadata: {
+            previousSettings: existing,
+            updatedSettings: updated,
+          },
+          timestamp: now,
+        });
+      }
+
+      return updated;
+    });
   }
 }

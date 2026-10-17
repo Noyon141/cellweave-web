@@ -4,4 +4,3 @@ export * from "./invitation-service";
 export * from "./project-permission-service";
 export * from "./audit-service";
 export * from "./audit-privacy";
-export * from "./audit-hook-wiring";
