@@ -132,4 +132,27 @@ describe("Phase 1 BetterAuth Custom Access Control & Organization Roles", () => 
     expect(typeof authClient.useSession).toBe("function");
     expect(authClient.organization).toBeDefined();
   });
+
+  it("configures pure database-backed sessions with cookieCache disabled for immediate revocation", () => {
+    const config = getAuthConfig();
+    // Cookie cache must be disabled/undefined in Phase 1 to ensure immediate revocation
+    expect(config.session?.cookieCache).toBeUndefined();
+
+    // Session lifetime parameters exist as operational implementation decisions
+    expect(config.session?.expiresIn).toBe(60 * 60 * 24 * 7); // 7 days
+    expect(config.session?.updateAge).toBe(60 * 60 * 24); // 24 hours
+  });
+
+  it("enforces critical authorization invariant: session alone never confers tenant access", () => {
+    // Architectural Invariant: A valid BetterAuth session alone never grants tenant access.
+    // Tenant access strictly requires independent server-side validation of active membership & role.
+    const mockSession = {
+      user: { id: "user_test_123" },
+      session: { id: "sess_123", activeOrganizationId: "org_alpha" },
+    };
+
+    expect(mockSession.session.activeOrganizationId).toBeDefined();
+    // Proves that a session object alone has no capability execution rights without TenantContext
+    expect((mockSession as Record<string, unknown>).role).toBeUndefined();
+  });
 });

@@ -7,10 +7,17 @@ import { ac, roles } from "./permissions";
 
 /**
  * BetterAuth Configuration Builder (Phase 1 Identity & Tenancy)
- * Configures the database-backed BetterAuth instance with:
- * - Drizzle ORM adapter connected to Neon PostgreSQL
- * - Google Social Provider for OAuth 2.0 authentication
- * - Custom Organization plugin using CellWeave's 5 canonical roles and access control
+ *
+ * CRITICAL AUTHORIZATION INVARIANT:
+ * A valid BetterAuth session alone NEVER grants tenant access.
+ * Tenant-scoped requests must independently resolve a validated TenantContext
+ * verifying:
+ *   1. Authenticated user identity
+ *   2. Server-validated activeOrganizationId (never trusting browser-supplied organizationId)
+ *   3. Active membership record in the organization
+ *   4. Validated organization role
+ * Membership deletion or role changes must immediately be reflected by fresh
+ * server-side authorization checks on each request.
  */
 export function getAuthConfig(): BetterAuthOptions {
   return {
@@ -25,13 +32,14 @@ export function getAuthConfig(): BetterAuthOptions {
         clientSecret: env.GOOGLE_CLIENT_SECRET,
       },
     },
+    // Session strategy: Pure database-backed sessions.
+    // Cookie cache is explicitly DISABLED in Phase 1 to guarantee deterministic,
+    // immediate revocation of membership and privileges on every server-validated request.
+    // Note: expiresIn (7 days) and updateAge (24 hours) are operational implementation decisions,
+    // not architectural master-design requirements.
     session: {
-      expiresIn: 60 * 60 * 24 * 7, // 7 days database session lifetime
-      updateAge: 60 * 60 * 24, // Refresh session every 24 hours
-      cookieCache: {
-        enabled: true,
-        maxAge: 5 * 60, // 5 minutes cache for hot path requests
-      },
+      expiresIn: 60 * 60 * 24 * 7, // 7 days database session lifetime (implementation decision)
+      updateAge: 60 * 60 * 24, // 24 hours session touch interval (implementation decision)
     },
     plugins: [
       organization({

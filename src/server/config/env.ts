@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-const envSchema = z.object({
+/**
+ * Authoritative Environment Configuration Schema
+ * Strictly validates runtime dependencies for CellWeave Web.
+ * Placeholder defaults for production/runtime secrets are strictly prohibited.
+ */
+export const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().default(3000),
   NEXT_PUBLIC_APP_URL: z.string().url().default("http://localhost:3000"),
@@ -11,16 +16,15 @@ const envSchema = z.object({
     .min(1)
     .default("postgresql://postgres:postgres@localhost:5432/cellweave_dev"),
 
-  // BetterAuth
+  // BetterAuth (Strictly required in real DEV/STAGING runtimes; no placeholder fallback defaults)
   BETTER_AUTH_SECRET: z
     .string()
-    .min(1)
-    .default("placeholder_secret_32_characters_minimum_length_required"),
-  BETTER_AUTH_URL: z.string().url().default("http://localhost:3000"),
+    .min(32, "BETTER_AUTH_SECRET must be at least 32 characters for high-entropy signing"),
+  BETTER_AUTH_URL: z.string().url("BETTER_AUTH_URL must be a valid URL"),
 
-  // Google OAuth (Phase 1 Identity)
-  GOOGLE_CLIENT_ID: z.string().default("placeholder_google_client_id"),
-  GOOGLE_CLIENT_SECRET: z.string().default("placeholder_google_client_secret"),
+  // Google OAuth (Phase 1 Identity; strictly required in real DEV/STAGING runtimes)
+  GOOGLE_CLIENT_ID: z.string().min(1, "GOOGLE_CLIENT_ID is required"),
+  GOOGLE_CLIENT_SECRET: z.string().min(1, "GOOGLE_CLIENT_SECRET is required"),
 
   // Cloudflare R2
   R2_ACCOUNT_ID: z.string().default("placeholder_r2_account_id"),
@@ -55,7 +59,8 @@ export function getEnv(): Env {
     const result = envSchema.safeParse(process.env);
     if (!result.success) {
       const formatted = result.error.format();
-      console.error("Invalid environment variables:", formatted);
+      // Safe error reporting: never print secret values
+      console.error("Environment validation failed for required variables");
       throw new Error(`Environment validation failed: ${JSON.stringify(formatted)}`);
     }
     parsedEnv = result.data;
@@ -63,4 +68,11 @@ export function getEnv(): Env {
   return parsedEnv;
 }
 
-export const env = getEnv();
+/**
+ * Dynamic proxy delegating to validated environment without early static crash.
+ */
+export const env: Env = new Proxy({} as Env, {
+  get(_target, prop: string) {
+    return getEnv()[prop as keyof Env];
+  },
+});
