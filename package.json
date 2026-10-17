@@ -37,6 +37,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@better-auth/cli": "^1.4.21",
     "@playwright/test": "^1.50.1",
     "@types/node": "^22.13.4",
     "@types/react": "^19.0.8",
