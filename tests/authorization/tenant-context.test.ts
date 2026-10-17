@@ -2,15 +2,14 @@ import { describe, it, expect } from "vitest";
 import {
   validateTenantAccess,
   TenantAuthorizationError,
-  type TenantContext,
 } from "@/server/authorization/tenant-context";
-import type { OrganizationId } from "@/types";
+import type { TenantContext, OrganizationRole } from "@/types";
 
 describe("Tenant Authorization Boundary Foundation", () => {
   const tenantA: TenantContext = {
-    organizationId: "org_alpha" as OrganizationId,
+    organizationId: "org_alpha",
     userId: "user_1",
-    roles: ["Scientist"],
+    role: "scientist" as OrganizationRole,
   };
 
   it("permits access when requesting resources belonging to active tenant", () => {
@@ -26,7 +25,7 @@ describe("Tenant Authorization Boundary Foundation", () => {
 
   it("rejects undefined or missing tenant context", () => {
     expect(() => {
-      validateTenantAccess(null as unknown as TenantContext, "org_alpha");
+      validateTenantAccess(null, "org_alpha");
     }).toThrow(TenantAuthorizationError);
   });
 });

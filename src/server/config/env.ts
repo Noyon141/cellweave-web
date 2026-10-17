@@ -18,6 +18,10 @@ const envSchema = z.object({
     .default("placeholder_secret_32_characters_minimum_length_required"),
   BETTER_AUTH_URL: z.string().url().default("http://localhost:3000"),
 
+  // Google OAuth (Phase 1 Identity)
+  GOOGLE_CLIENT_ID: z.string().default("placeholder_google_client_id"),
+  GOOGLE_CLIENT_SECRET: z.string().default("placeholder_google_client_secret"),
+
   // Cloudflare R2
   R2_ACCOUNT_ID: z.string().default("placeholder_r2_account_id"),
   R2_ACCESS_KEY_ID: z.string().default("placeholder_r2_access_key_id"),

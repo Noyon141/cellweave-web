@@ -1,11 +1,6 @@
-import type { OrganizationId } from "@/types";
+import type { TenantContext } from "@/types";
 
-export interface TenantContext {
-  readonly organizationId: OrganizationId;
-  readonly userId: string;
-  readonly roles: readonly string[];
-  readonly isSystemAdmin?: boolean;
-}
+export type { TenantContext };
 
 export class TenantAuthorizationError extends Error {
   constructor(message: string) {
@@ -19,9 +14,9 @@ export class TenantAuthorizationError extends Error {
  * Prevents cross-tenant IDOR violations.
  */
 export function validateTenantAccess(
-  tenant: TenantContext,
+  tenant: TenantContext | null | undefined,
   targetOrganizationId: string
-): OrganizationId {
+): string {
   if (!tenant || !tenant.organizationId) {
     throw new TenantAuthorizationError("Missing or unauthenticated TenantContext");
   }

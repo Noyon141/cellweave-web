@@ -26,6 +26,8 @@ export type {
   ComputeProvider,
   RunManifest,
   ArtifactManifest,
+  OrganizationRole,
+  TenantContext,
 } from "@cellweave/contracts";
 
 export {
@@ -36,4 +38,5 @@ export {
   RESOURCE_CLASSES,
   ARTIFACT_TYPES,
   SCIENTIFIC_JOB_TYPES,
+  ORGANIZATION_ROLES,
 } from "@cellweave/contracts";

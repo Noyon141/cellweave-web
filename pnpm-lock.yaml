@@ -271,7 +271,7 @@ packages:
     resolution: {integrity: sha512-Gs7n99b5tqUC6cQAPbV0uED3IraHB6xQbHLQ/C3l7ZFafHScOx9pQ+DYmP5blbLFShVWLqxNUlI9wi4xU/X+ow==}
 
   '@cellweave/contracts@file:vendor/cellweave-contracts-0.1.0.tgz':
-    resolution: {integrity: sha512-CqD0VwvWjCiMmu4otUc64cSfmzREvG9QXc1m4aProBtW0rWboDHXKIAgXhsNf32OJFlJEDwgmnPjL1UqrK99UQ==, tarball: file:vendor/cellweave-contracts-0.1.0.tgz}
+    resolution: {integrity: sha512-IhNPO3kxmKiph3/BlZA7UIZTl1RCccbHSr0/XeVJ0pJMBiJldsMxJMcMFUY3ZieL5U+uWXe1rSnC4oAtmSyPcg==, tarball: file:vendor/cellweave-contracts-0.1.0.tgz}
     version: 0.1.0
     engines: {node: '>=20.0.0'}
 

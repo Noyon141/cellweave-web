@@ -7,6 +7,7 @@ import {
   RESOURCE_CLASSES,
   ARTIFACT_TYPES,
   SCIENTIFIC_JOB_TYPES,
+  ORGANIZATION_ROLES,
   type OrganizationId,
   type ProjectId,
   type AnalysisRunId,
@@ -55,5 +56,15 @@ describe("Cross-Language Contracts Integration", () => {
     expect(typeof orgId).toBe("string");
     expect(typeof projId).toBe("string");
     expect(typeof runId).toBe("string");
+  });
+
+  it("imports canonical organization roles from generated contracts", () => {
+    expect(ORGANIZATION_ROLES).toEqual([
+      "owner",
+      "admin",
+      "bioinformatician",
+      "scientist",
+      "viewer",
+    ]);
   });
 });
