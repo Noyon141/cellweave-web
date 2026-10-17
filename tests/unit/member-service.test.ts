@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { MemberService } from "@/server/services/member-service";
+import { MemberService, type BetterAuthMemberApi } from "@/server/services/member-service";
 import {
   TenantAuthorizationError,
   ResourceNotFoundError,
@@ -20,7 +20,7 @@ function makeContext(
   };
 }
 
-describe("Member Application Service Tests (Step F)", () => {
+describe("Member Application Service Tests (Step F / Step H)", () => {
   describe("List Members Authorization", () => {
     it("owner and admin can list same-org members", async () => {
       const mockRows = [
@@ -106,7 +106,7 @@ describe("Member Application Service Tests (Step F)", () => {
     const targetRoles: OrganizationRole[] = ["admin", "bioinformatician", "scientist", "viewer"];
 
     for (const targetRole of targetRoles) {
-      it(`owner can assign canonical role '${targetRole}'`, async () => {
+      it(`owner can assign canonical role '${targetRole}' via BetterAuth API`, async () => {
         const targetMember = {
           id: "mem_2",
           organizationId: "org_alpha",
@@ -119,7 +119,6 @@ describe("Member Application Service Tests (Step F)", () => {
         };
 
         const mockDb = {
-          transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
           select: () => ({
             from: () => ({
               innerJoin: () => ({
@@ -127,24 +126,39 @@ describe("Member Application Service Tests (Step F)", () => {
               }),
             }),
           }),
-          update: () => ({
-            set: () => ({
-              where: () => Promise.resolve(),
-            }),
-          }),
+          update: vi.fn(),
+          delete: vi.fn(),
           insert: () => ({
             values: () => Promise.resolve(),
           }),
         } as unknown as DbClient;
 
-        const service = new MemberService({ dbClient: mockDb });
+        const mockAuthApi: BetterAuthMemberApi = {
+          updateMemberRole: vi
+            .fn()
+            .mockResolvedValue({ member: { id: "mem_2", role: targetRole } }),
+          removeMember: vi.fn(),
+        };
+
+        const service = new MemberService({ dbClient: mockDb, authApi: mockAuthApi });
         const ctx = makeContext("owner");
         const res = await service.updateMemberRole(ctx, "org_alpha", "mem_2", targetRole);
 
         expect(res.role).toBe(targetRole);
+        expect(mockAuthApi.updateMemberRole).toHaveBeenCalledWith({
+          body: {
+            memberId: "mem_2",
+            role: targetRole,
+            organizationId: "org_alpha",
+          },
+          headers: undefined,
+        });
+        // Direct Drizzle mutations on BetterAuth member table MUST NOT be invoked
+        expect(mockDb.update).not.toHaveBeenCalled();
+        expect(mockDb.delete).not.toHaveBeenCalled();
       });
 
-      it(`admin can assign canonical role '${targetRole}'`, async () => {
+      it(`admin can assign canonical role '${targetRole}' via BetterAuth API`, async () => {
         const targetMember = {
           id: "mem_2",
           organizationId: "org_alpha",
@@ -157,7 +171,6 @@ describe("Member Application Service Tests (Step F)", () => {
         };
 
         const mockDb = {
-          transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
           select: () => ({
             from: () => ({
               innerJoin: () => ({
@@ -165,21 +178,27 @@ describe("Member Application Service Tests (Step F)", () => {
               }),
             }),
           }),
-          update: () => ({
-            set: () => ({
-              where: () => Promise.resolve(),
-            }),
-          }),
+          update: vi.fn(),
+          delete: vi.fn(),
           insert: () => ({
             values: () => Promise.resolve(),
           }),
         } as unknown as DbClient;
 
-        const service = new MemberService({ dbClient: mockDb });
+        const mockAuthApi: BetterAuthMemberApi = {
+          updateMemberRole: vi
+            .fn()
+            .mockResolvedValue({ member: { id: "mem_2", role: targetRole } }),
+          removeMember: vi.fn(),
+        };
+
+        const service = new MemberService({ dbClient: mockDb, authApi: mockAuthApi });
         const ctx = makeContext("admin");
         const res = await service.updateMemberRole(ctx, "org_alpha", "mem_2", targetRole);
 
         expect(res.role).toBe(targetRole);
+        expect(mockAuthApi.updateMemberRole).toHaveBeenCalledTimes(1);
+        expect(mockDb.update).not.toHaveBeenCalled();
       });
     }
 
@@ -196,7 +215,6 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -206,12 +224,18 @@ describe("Member Application Service Tests (Step F)", () => {
         }),
       } as unknown as DbClient;
 
-      const service = new MemberService({ dbClient: mockDb });
+      const mockAuthApi: BetterAuthMemberApi = {
+        updateMemberRole: vi.fn(),
+        removeMember: vi.fn(),
+      };
+
+      const service = new MemberService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("admin");
 
       await expect(service.updateMemberRole(ctx, "org_alpha", "mem_2", "owner")).rejects.toThrow(
         TenantAuthorizationError
       );
+      expect(mockAuthApi.updateMemberRole).not.toHaveBeenCalled();
     });
 
     it("admin cannot modify an owner membership", async () => {
@@ -227,7 +251,6 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -237,12 +260,18 @@ describe("Member Application Service Tests (Step F)", () => {
         }),
       } as unknown as DbClient;
 
-      const service = new MemberService({ dbClient: mockDb });
+      const mockAuthApi: BetterAuthMemberApi = {
+        updateMemberRole: vi.fn(),
+        removeMember: vi.fn(),
+      };
+
+      const service = new MemberService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("admin");
 
       await expect(
         service.updateMemberRole(ctx, "org_alpha", "mem_owner", "scientist")
       ).rejects.toThrow(TenantAuthorizationError);
+      expect(mockAuthApi.updateMemberRole).not.toHaveBeenCalled();
     });
 
     it("admin cannot remove an owner", async () => {
@@ -254,7 +283,6 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([ownerMember]),
@@ -262,12 +290,18 @@ describe("Member Application Service Tests (Step F)", () => {
         }),
       } as unknown as DbClient;
 
-      const service = new MemberService({ dbClient: mockDb });
+      const mockAuthApi: BetterAuthMemberApi = {
+        updateMemberRole: vi.fn(),
+        removeMember: vi.fn(),
+      };
+
+      const service = new MemberService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("admin");
 
       await expect(service.removeMember(ctx, "org_alpha", "mem_owner")).rejects.toThrow(
         TenantAuthorizationError
       );
+      expect(mockAuthApi.removeMember).not.toHaveBeenCalled();
     });
 
     it("owner cannot be removed (prevents ownerless org)", async () => {
@@ -279,7 +313,6 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([ownerMember]),
@@ -287,12 +320,18 @@ describe("Member Application Service Tests (Step F)", () => {
         }),
       } as unknown as DbClient;
 
-      const service = new MemberService({ dbClient: mockDb });
+      const mockAuthApi: BetterAuthMemberApi = {
+        updateMemberRole: vi.fn(),
+        removeMember: vi.fn(),
+      };
+
+      const service = new MemberService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("owner");
 
       await expect(service.removeMember(ctx, "org_alpha", "mem_owner")).rejects.toThrow(
         TenantAuthorizationError
       );
+      expect(mockAuthApi.removeMember).not.toHaveBeenCalled();
     });
 
     it("rejects generic 'member' role", async () => {
@@ -315,7 +354,6 @@ describe("Member Application Service Tests (Step F)", () => {
 
     it("foreign-tenant member mutation is rejected and non-disclosing", async () => {
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -353,7 +391,6 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -362,24 +399,22 @@ describe("Member Application Service Tests (Step F)", () => {
             where: () => Promise.resolve([targetMember]),
           }),
         }),
-        update: () => ({
-          set: () => ({
-            where: () => Promise.resolve(),
-          }),
-        }),
-        delete: () => ({
-          where: () => Promise.resolve(),
-        }),
         insert: () => ({
           values: () => Promise.resolve(),
         }),
       } as unknown as DbClient;
 
-      const service = new MemberService({ dbClient: mockDb, auditHook });
+      const mockAuthApi: BetterAuthMemberApi = {
+        updateMemberRole: vi.fn().mockResolvedValue({}),
+        removeMember: vi.fn().mockResolvedValue({}),
+      };
+
+      const service = new MemberService({ dbClient: mockDb, auditHook, authApi: mockAuthApi });
       const ctx = makeContext("owner", "org_alpha", "usr_actor_owner");
 
       // 1. Role Change
       await service.updateMemberRole(ctx, "org_alpha", "mem_2", "viewer");
+      expect(mockAuthApi.updateMemberRole).toHaveBeenCalledTimes(1);
       expect(auditHook).toHaveBeenCalledWith(
         expect.objectContaining({
           eventType: "member.role.changed",
@@ -391,6 +426,7 @@ describe("Member Application Service Tests (Step F)", () => {
 
       // 2. Removal
       await service.removeMember(ctx, "org_alpha", "mem_2");
+      expect(mockAuthApi.removeMember).toHaveBeenCalledTimes(1);
       expect(auditHook).toHaveBeenCalledWith(
         expect.objectContaining({
           eventType: "member.removed",
@@ -400,7 +436,7 @@ describe("Member Application Service Tests (Step F)", () => {
       );
     });
 
-    it("rolls back member role change when transactional audit persistence fails", async () => {
+    it("surfaces error when audit persistence fails after BetterAuth member role change", async () => {
       const targetMember = {
         id: "mem_fail",
         organizationId: "org_alpha",
@@ -413,7 +449,6 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
@@ -421,12 +456,12 @@ describe("Member Application Service Tests (Step F)", () => {
             }),
           }),
         }),
-        update: () => ({
-          set: () => ({
-            where: () => Promise.resolve(),
-          }),
-        }),
       } as unknown as DbClient;
+
+      const mockAuthApi: BetterAuthMemberApi = {
+        updateMemberRole: vi.fn().mockResolvedValue({}),
+        removeMember: vi.fn(),
+      };
 
       const failingAuditService = {
         recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
@@ -434,6 +469,7 @@ describe("Member Application Service Tests (Step F)", () => {
 
       const service = new MemberService({
         dbClient: mockDb,
+        authApi: mockAuthApi,
         auditService: failingAuditService as unknown as InstanceType<
           typeof import("@/server/services/audit-service").AuditService
         >,
@@ -443,9 +479,11 @@ describe("Member Application Service Tests (Step F)", () => {
       await expect(
         service.updateMemberRole(ctx, "org_alpha", "mem_fail", "scientist")
       ).rejects.toThrow("Audit DB down");
+
+      expect(mockAuthApi.updateMemberRole).toHaveBeenCalledTimes(1);
     });
 
-    it("rolls back member removal when transactional audit persistence fails", async () => {
+    it("surfaces error when audit persistence fails after BetterAuth member removal", async () => {
       const targetMember = {
         id: "mem_fail",
         organizationId: "org_alpha",
@@ -454,16 +492,17 @@ describe("Member Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([targetMember]),
           }),
         }),
-        delete: () => ({
-          where: () => Promise.resolve(),
-        }),
       } as unknown as DbClient;
+
+      const mockAuthApi: BetterAuthMemberApi = {
+        updateMemberRole: vi.fn(),
+        removeMember: vi.fn().mockResolvedValue({}),
+      };
 
       const failingAuditService = {
         recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
@@ -471,6 +510,7 @@ describe("Member Application Service Tests (Step F)", () => {
 
       const service = new MemberService({
         dbClient: mockDb,
+        authApi: mockAuthApi,
         auditService: failingAuditService as unknown as InstanceType<
           typeof import("@/server/services/audit-service").AuditService
         >,
@@ -480,6 +520,8 @@ describe("Member Application Service Tests (Step F)", () => {
       await expect(service.removeMember(ctx, "org_alpha", "mem_fail")).rejects.toThrow(
         "Audit DB down"
       );
+
+      expect(mockAuthApi.removeMember).toHaveBeenCalledTimes(1);
     });
   });
 });

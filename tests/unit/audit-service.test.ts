@@ -10,7 +10,7 @@ import type { TenantContext, OrganizationRole } from "@/types";
 import type { DbClient, DatabaseExecutor } from "@/server/database/client";
 import { auditEvents } from "@/server/database/schema/audit-events";
 import { projects, projectMembers } from "@/server/database/schema/projects";
-import { member, invitation } from "@/server/database/schema/auth";
+import { member } from "@/server/database/schema/auth";
 
 function makeContext(
   role: OrganizationRole,
@@ -328,9 +328,8 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       expect(insertedAudit!.actorType).toBe("user");
     });
 
-    it("18. member role change persists member.role_changed audit event atomically", async () => {
+    it("18. member role change delegates to BetterAuth API and persists member.role_changed audit event", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      let updatedRole: string | null = null;
 
       const targetMember = {
         id: "mem_2",
@@ -344,21 +343,12 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             innerJoin: () => ({
               where: () => Promise.resolve([targetMember]),
             }),
           }),
-        }),
-        update: () => ({
-          set: (vals: { role: string }) => {
-            updatedRole = vals.role;
-            return {
-              where: () => Promise.resolve(),
-            };
-          },
         }),
         insert: (table: unknown) => ({
           values: (vals: Record<string, unknown>) => {
@@ -370,11 +360,23 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         }),
       } as unknown as DbClient;
 
-      const memberService = new MemberService({ dbClient: mockDb });
+      const mockAuthApi = {
+        updateMemberRole: vi.fn().mockResolvedValue({}),
+        removeMember: vi.fn(),
+      };
+
+      const memberService = new MemberService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("admin", "org_alpha", "usr_admin_1");
       await memberService.updateMemberRole(ctx, "org_alpha", "mem_2", "scientist");
 
-      expect(updatedRole).toBe("scientist");
+      expect(mockAuthApi.updateMemberRole).toHaveBeenCalledWith({
+        body: {
+          memberId: "mem_2",
+          role: "scientist",
+          organizationId: "org_alpha",
+        },
+        headers: undefined,
+      });
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("member.role_changed");
       expect(insertedAudit!.actorId).toBe("usr_admin_1");
@@ -385,9 +387,8 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       });
     });
 
-    it("19. member removal persists member.removed audit event atomically", async () => {
+    it("19. member removal delegates to BetterAuth API and persists member.removed audit event", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      let deletedMember = false;
 
       const targetMember = {
         id: "mem_3",
@@ -397,17 +398,10 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([targetMember]),
           }),
-        }),
-        delete: () => ({
-          where: () => {
-            deletedMember = true;
-            return Promise.resolve();
-          },
         }),
         insert: (table: unknown) => ({
           values: (vals: Record<string, unknown>) => {
@@ -419,11 +413,22 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         }),
       } as unknown as DbClient;
 
-      const memberService = new MemberService({ dbClient: mockDb });
+      const mockAuthApi = {
+        updateMemberRole: vi.fn(),
+        removeMember: vi.fn().mockResolvedValue({}),
+      };
+
+      const memberService = new MemberService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("owner", "org_alpha", "usr_owner");
       await memberService.removeMember(ctx, "org_alpha", "mem_3");
 
-      expect(deletedMember).toBe(true);
+      expect(mockAuthApi.removeMember).toHaveBeenCalledWith({
+        body: {
+          memberIdOrEmail: "mem_3",
+          organizationId: "org_alpha",
+        },
+        headers: undefined,
+      });
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("member.removed");
       expect(insertedAudit!.actorId).toBe("usr_owner");
@@ -433,12 +438,10 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       });
     });
 
-    it("20. invitation creation persists user.invited audit event atomically", async () => {
+    it("20. invitation creation delegates to BetterAuth API and persists user.invited audit event", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      let insertedInv: Record<string, unknown> | null = null;
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]), // no duplicates
@@ -448,31 +451,48 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
           values: (vals: Record<string, unknown>) => {
             if (table === auditEvents) {
               insertedAudit = vals;
-            } else if (table === invitation) {
-              insertedInv = vals;
             }
             return Promise.resolve();
           },
         }),
       } as unknown as DbClient;
 
-      const invService = new InvitationService({ dbClient: mockDb });
+      const mockAuthApi = {
+        createInvitation: vi.fn().mockResolvedValue({
+          id: "inv_auth_999",
+          email: "invitee@example.com",
+          role: "scientist",
+          organizationId: "org_alpha",
+          inviterId: "usr_owner",
+          status: "pending",
+          expiresAt: new Date(),
+        }),
+        cancelInvitation: vi.fn(),
+      };
+
+      const invService = new InvitationService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("owner", "org_alpha", "usr_owner");
       const res = await invService.createInvitation(ctx, "org_alpha", {
         email: "invitee@example.com",
         role: "scientist",
       });
 
-      expect(insertedInv).not.toBeNull();
+      expect(mockAuthApi.createInvitation).toHaveBeenCalledWith({
+        body: {
+          email: "invitee@example.com",
+          role: "scientist",
+          organizationId: "org_alpha",
+        },
+        headers: undefined,
+      });
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("user.invited");
       expect(insertedAudit!.resourceId).toBe(res.id);
       expect((insertedAudit!.metadata as Record<string, unknown>).role).toBe("scientist");
     });
 
-    it("21. invitation cancellation persists invitation.canceled audit event atomically", async () => {
+    it("21. invitation cancellation delegates to BetterAuth API and persists invitation.canceled audit event", async () => {
       let insertedAudit: Record<string, unknown> | null = null;
-      let canceled = false;
 
       const existingInv = {
         id: "inv_cancel_target",
@@ -482,18 +502,9 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([existingInv]),
-          }),
-        }),
-        update: () => ({
-          set: () => ({
-            where: () => {
-              canceled = true;
-              return Promise.resolve();
-            },
           }),
         }),
         insert: (table: unknown) => ({
@@ -506,11 +517,21 @@ describe("Audit Logging Framework & Persistence Tests (Step H)", () => {
         }),
       } as unknown as DbClient;
 
-      const invService = new InvitationService({ dbClient: mockDb });
+      const mockAuthApi = {
+        createInvitation: vi.fn(),
+        cancelInvitation: vi.fn().mockResolvedValue({}),
+      };
+
+      const invService = new InvitationService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("admin", "org_alpha", "usr_admin");
       await invService.cancelInvitation(ctx, "org_alpha", "inv_cancel_target");
 
-      expect(canceled).toBe(true);
+      expect(mockAuthApi.cancelInvitation).toHaveBeenCalledWith({
+        body: {
+          invitationId: "inv_cancel_target",
+        },
+        headers: undefined,
+      });
       expect(insertedAudit).not.toBeNull();
       expect(insertedAudit!.action).toBe("invitation.canceled");
       expect(insertedAudit!.resourceId).toBe("inv_cancel_target");

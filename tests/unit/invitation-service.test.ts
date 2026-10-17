@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
-import { InvitationService } from "@/server/services/invitation-service";
+import {
+  InvitationService,
+  type BetterAuthInvitationApi,
+} from "@/server/services/invitation-service";
+import { invitation } from "@/server/database/schema/auth";
 import {
   TenantAuthorizationError,
   ConflictError,
@@ -21,7 +25,7 @@ function makeContext(
   };
 }
 
-describe("Invitation Application Service Tests (Step F)", () => {
+describe("Invitation Application Service Tests (Step F / Step H)", () => {
   describe("Invitation Creation Authorization & Role Bounds", () => {
     const canonicalNonOwnerRoles: OrganizationRole[] = [
       "admin",
@@ -31,27 +35,45 @@ describe("Invitation Application Service Tests (Step F)", () => {
     ];
 
     for (const targetRole of canonicalNonOwnerRoles) {
-      it(`owner can invite canonical non-owner role '${targetRole}'`, async () => {
-        let insertedValues: Record<string, unknown> | null = null;
+      it(`owner can invite canonical non-owner role '${targetRole}' via BetterAuth API`, async () => {
+        const mockInsert = vi.fn().mockImplementation((table: unknown) => {
+          if (table === invitation) {
+            throw new Error("Direct Drizzle insert on BetterAuth invitation table is forbidden!");
+          }
+          return {
+            values: () => Promise.resolve(),
+          };
+        });
+
         const mockDb = {
-          transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
           select: () => ({
             from: () => ({
               where: () => Promise.resolve([]), // no active duplicate
             }),
           }),
-          insert: () => ({
-            values: (vals: Record<string, unknown>) => {
-              insertedValues = vals;
-              return Promise.resolve();
-            },
-          }),
+          insert: mockInsert,
+          update: vi.fn(),
+          delete: vi.fn(),
         } as unknown as DbClient;
+
+        const mockAuthApi: BetterAuthInvitationApi = {
+          createInvitation: vi.fn().mockResolvedValue({
+            id: "inv_auth_123",
+            email: "colleague@example.com",
+            role: targetRole,
+            organizationId: "org_alpha",
+            inviterId: "usr_actor",
+            status: "pending",
+            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+          }),
+          cancelInvitation: vi.fn(),
+        };
 
         const deliveryAdapter = { recordInvitation: vi.fn() };
         const service = new InvitationService({
           dbClient: mockDb,
           deliveryAdapter,
+          authApi: mockAuthApi,
         });
 
         const ctx = makeContext("owner");
@@ -63,25 +85,55 @@ describe("Invitation Application Service Tests (Step F)", () => {
         expect(res.role).toBe(targetRole);
         expect(res.email).toBe("colleague@example.com");
         expect(res.status).toBe("pending");
-        expect(insertedValues).not.toBeNull();
+        expect(res.id).toBe("inv_auth_123");
+
+        expect(mockAuthApi.createInvitation).toHaveBeenCalledWith({
+          body: {
+            email: "colleague@example.com",
+            role: targetRole,
+            organizationId: "org_alpha",
+          },
+          headers: undefined,
+        });
+        // Direct Drizzle insert on BetterAuth invitation table MUST NOT be invoked
+        expect(mockInsert).not.toHaveBeenCalledWith(invitation);
         expect(deliveryAdapter.recordInvitation).toHaveBeenCalledTimes(1);
       });
     }
 
-    it("admin can invite roles up to admin", async () => {
+    it("admin can invite roles up to admin via BetterAuth API", async () => {
+      const mockInsert = vi.fn().mockImplementation((table: unknown) => {
+        if (table === invitation) {
+          throw new Error("Direct Drizzle insert on BetterAuth invitation table is forbidden!");
+        }
+        return {
+          values: () => Promise.resolve(),
+        };
+      });
+
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
           }),
         }),
-        insert: () => ({
-          values: () => Promise.resolve(),
-        }),
+        insert: mockInsert,
       } as unknown as DbClient;
 
-      const service = new InvitationService({ dbClient: mockDb });
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn().mockResolvedValue({
+          id: "inv_admin_456",
+          email: "newadmin@example.com",
+          role: "admin",
+          organizationId: "org_alpha",
+          inviterId: "usr_actor",
+          status: "pending",
+          expiresAt: new Date(),
+        }),
+        cancelInvitation: vi.fn(),
+      };
+
+      const service = new InvitationService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("admin");
 
       const res = await service.createInvitation(ctx, "org_alpha", {
@@ -89,10 +141,16 @@ describe("Invitation Application Service Tests (Step F)", () => {
         role: "admin",
       });
       expect(res.role).toBe("admin");
+      expect(mockAuthApi.createInvitation).toHaveBeenCalledTimes(1);
+      expect(mockInsert).not.toHaveBeenCalledWith(invitation);
     });
 
     it("admin cannot invite owner", async () => {
-      const service = new InvitationService({ dbClient: {} as DbClient });
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn(),
+        cancelInvitation: vi.fn(),
+      };
+      const service = new InvitationService({ dbClient: {} as DbClient, authApi: mockAuthApi });
       const ctx = makeContext("admin");
 
       await expect(
@@ -101,181 +159,122 @@ describe("Invitation Application Service Tests (Step F)", () => {
           role: "owner",
         })
       ).rejects.toThrow(TenantAuthorizationError);
+      expect(mockAuthApi.createInvitation).not.toHaveBeenCalled();
     });
 
-    it("owner invitation is rejected in Phase 1 (no improvised ownership transfer)", async () => {
-      const service = new InvitationService({ dbClient: {} as DbClient });
+    it("owner invitation is rejected in Phase 1 even when requested by owner", async () => {
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn(),
+        cancelInvitation: vi.fn(),
+      };
+      const service = new InvitationService({ dbClient: {} as DbClient, authApi: mockAuthApi });
       const ctx = makeContext("owner");
 
       await expect(
         service.createInvitation(ctx, "org_alpha", {
-          email: "transfer@example.com",
+          email: "owner2@example.com",
           role: "owner",
         })
       ).rejects.toThrow(TenantAuthorizationError);
+      expect(mockAuthApi.createInvitation).not.toHaveBeenCalled();
     });
 
-    const unauthorizedInviters: OrganizationRole[] = ["bioinformatician", "scientist", "viewer"];
-
-    for (const role of unauthorizedInviters) {
+    const nonAdminRoles: OrganizationRole[] = ["bioinformatician", "scientist", "viewer"];
+    for (const role of nonAdminRoles) {
       it(`${role} cannot invite members`, async () => {
-        const service = new InvitationService({ dbClient: {} as DbClient });
+        const mockAuthApi: BetterAuthInvitationApi = {
+          createInvitation: vi.fn(),
+          cancelInvitation: vi.fn(),
+        };
+        const service = new InvitationService({ dbClient: {} as DbClient, authApi: mockAuthApi });
         const ctx = makeContext(role);
 
         await expect(
           service.createInvitation(ctx, "org_alpha", {
-            email: "user@example.com",
-            role: "viewer",
+            email: "someone@example.com",
+            role: "scientist",
           })
         ).rejects.toThrow(TenantAuthorizationError);
+        expect(mockAuthApi.createInvitation).not.toHaveBeenCalled();
       });
     }
 
-    it("non-canonical role is rejected", async () => {
+    it("rejects non-canonical role string", async () => {
       const service = new InvitationService({ dbClient: {} as DbClient });
       const ctx = makeContext("owner");
 
       await expect(
         service.createInvitation(ctx, "org_alpha", {
-          email: "user@example.com",
-          role: "contributor_not_canonical",
+          email: "test@example.com",
+          role: "guest",
         })
       ).rejects.toThrow(ValidationError);
     });
-  });
 
-  describe("Active Duplicate Prevention & Re-invitation Semantics", () => {
-    it("rejects duplicate active pending invitation for identical email", async () => {
-      const existingPending = {
-        id: "inv_existing",
-        email: "alice@example.com",
-        status: "pending",
-        expiresAt: new Date(Date.now() + 100000), // active in future
-      };
-
-      const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
-        select: () => ({
-          from: () => ({
-            where: () => Promise.resolve([existingPending]),
-          }),
-        }),
-      } as unknown as DbClient;
-
-      const service = new InvitationService({ dbClient: mockDb });
+    it("rejects invalid email format", async () => {
+      const service = new InvitationService({ dbClient: {} as DbClient });
       const ctx = makeContext("owner");
 
       await expect(
         service.createInvitation(ctx, "org_alpha", {
-          email: "alice@example.com",
+          email: "not-an-email",
           role: "scientist",
         })
-      ).rejects.toThrow(ConflictError);
+      ).rejects.toThrow(ValidationError);
     });
 
-    it("email normalization prevents duplicate active invitations caused by case differences", async () => {
-      const existingPending = {
-        id: "inv_existing",
-        email: "alice@example.com",
-        status: "pending",
-        expiresAt: new Date(Date.now() + 100000),
-      };
-
-      let queriedEmail: string | null = null;
-      const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
-        select: () => ({
-          from: () => ({
-            where: () => {
-              queriedEmail = "alice@example.com";
-              return Promise.resolve([existingPending]);
-            },
-          }),
-        }),
-      } as unknown as DbClient;
-
-      const service = new InvitationService({ dbClient: mockDb });
-      const ctx = makeContext("admin");
-
-      // Provided with uppercase / whitespace
-      await expect(
-        service.createInvitation(ctx, "org_alpha", {
-          email: "  ALICE@EXAMPLE.COM  ",
-          role: "scientist",
-        })
-      ).rejects.toThrow(ConflictError);
-
-      expect(queriedEmail).toBe("alice@example.com");
-    });
-
-    it("expired invitation permits reinvitation", async () => {
-      // In the database, the query filters for `expiresAt > now`.
-      // If previous invitation is expired, the query returns 0 rows.
-      const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
-        select: () => ({
-          from: () => ({
-            where: () => Promise.resolve([]), // no active unexpired invitation
-          }),
-        }),
-        insert: () => ({
-          values: () => Promise.resolve(),
-        }),
-      } as unknown as DbClient;
-
-      const service = new InvitationService({ dbClient: mockDb });
-      const ctx = makeContext("owner");
-
-      const res = await service.createInvitation(ctx, "org_alpha", {
-        email: "alice@example.com",
-        role: "scientist",
-      });
-
-      expect(res.status).toBe("pending");
-      expect(res.email).toBe("alice@example.com");
-    });
-
-    it("canceled or rejected historical invitation permits reinvitation", async () => {
-      // Similarly, query filters for `status = 'pending'`.
-      // Canceled/rejected rows do not match, returning 0 rows.
-      const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
-        select: () => ({
-          from: () => ({
-            where: () => Promise.resolve([]),
-          }),
-        }),
-        insert: () => ({
-          values: () => Promise.resolve(),
-        }),
-      } as unknown as DbClient;
-
-      const service = new InvitationService({ dbClient: mockDb });
-      const ctx = makeContext("admin");
-
-      const res = await service.createInvitation(ctx, "org_alpha", {
-        email: "rejected_user@example.com",
-        role: "viewer",
-      });
-
-      expect(res.status).toBe("pending");
-    });
-
-    it("invitation for foreign tenant cannot be created through forged orgId", async () => {
+    it("rejects invitation creation for foreign organization", async () => {
       const service = new InvitationService({ dbClient: {} as DbClient });
       const ctx = makeContext("owner", "org_alpha");
 
       await expect(
         service.createInvitation(ctx, "org_beta_foreign", {
-          email: "target@example.com",
-          role: "viewer",
+          email: "colleague@example.com",
+          role: "scientist",
         })
       ).rejects.toThrow(TenantAuthorizationError);
     });
+  });
 
-    it("rolls back invitation creation when transactional audit persistence fails", async () => {
+  describe("Active Duplicate Prevention & Re-invitation", () => {
+    it("rejects invitation when active pending invitation exists for normalized email", async () => {
+      const futureDate = new Date(Date.now() + 1000 * 60 * 60 * 24); // +1 day
+      const existingPending = [
+        {
+          id: "inv_existing",
+          email: "colleague@example.com",
+          status: "pending",
+          expiresAt: futureDate,
+        },
+      ];
+
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+        select: () => ({
+          from: () => ({
+            where: () => Promise.resolve(existingPending),
+          }),
+        }),
+      } as unknown as DbClient;
+
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn(),
+        cancelInvitation: vi.fn(),
+      };
+
+      const service = new InvitationService({ dbClient: mockDb, authApi: mockAuthApi });
+      const ctx = makeContext("owner");
+
+      await expect(
+        service.createInvitation(ctx, "org_alpha", {
+          email: "   COLLEAGUE@example.com  ",
+          role: "scientist",
+        })
+      ).rejects.toThrow(ConflictError);
+      expect(mockAuthApi.createInvitation).not.toHaveBeenCalled();
+    });
+
+    it("permits re-invitation if previous invitation expired or canceled", async () => {
+      const mockDb = {
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]),
@@ -286,29 +285,84 @@ describe("Invitation Application Service Tests (Step F)", () => {
         }),
       } as unknown as DbClient;
 
-      const failingAuditService = {
-        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn().mockResolvedValue({
+          id: "inv_reinvited",
+          email: "colleague@example.com",
+          role: "scientist",
+          organizationId: "org_alpha",
+          inviterId: "usr_actor",
+          status: "pending",
+          expiresAt: new Date(),
+        }),
+        cancelInvitation: vi.fn(),
       };
 
-      const service = new InvitationService({
-        dbClient: mockDb,
-        auditService: failingAuditService as unknown as InstanceType<
-          typeof import("@/server/services/audit-service").AuditService
-        >,
-      });
-      const ctx = makeContext("owner", "org_alpha");
+      const service = new InvitationService({ dbClient: mockDb, authApi: mockAuthApi });
+      const ctx = makeContext("owner");
 
-      await expect(
-        service.createInvitation(ctx, "org_alpha", {
-          email: "fail_invitee@example.com",
+      const res = await service.createInvitation(ctx, "org_alpha", {
+        email: "colleague@example.com",
+        role: "scientist",
+      });
+
+      expect(res.id).toBe("inv_reinvited");
+      expect(mockAuthApi.createInvitation).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("List Invitations", () => {
+    it("lists invitations strictly scoped to active organization", async () => {
+      const mockRows = [
+        {
+          id: "inv_1",
+          organizationId: "org_alpha",
+          email: "user1@example.com",
           role: "scientist",
-        })
-      ).rejects.toThrow("Audit DB down");
+          status: "pending",
+          expiresAt: new Date(),
+          createdAt: new Date(),
+          inviterId: "usr_actor",
+        },
+      ];
+
+      const mockDb = {
+        select: () => ({
+          from: () => ({
+            where: () => Promise.resolve(mockRows),
+          }),
+        }),
+      } as unknown as DbClient;
+
+      const service = new InvitationService({ dbClient: mockDb });
+      const ctx = makeContext("admin");
+
+      const list = await service.listInvitations(ctx, "org_alpha");
+      expect(list).toHaveLength(1);
+      expect(list[0]?.id).toBe("inv_1");
+    });
+
+    it("rejects list invitations for foreign organization", async () => {
+      const service = new InvitationService({ dbClient: {} as DbClient });
+      const ctx = makeContext("admin", "org_alpha");
+
+      await expect(service.listInvitations(ctx, "org_beta_foreign")).rejects.toThrow(
+        TenantAuthorizationError
+      );
+    });
+
+    it("non-admin roles cannot list invitations", async () => {
+      const service = new InvitationService({ dbClient: {} as DbClient });
+      const ctx = makeContext("scientist");
+
+      await expect(service.listInvitations(ctx, "org_alpha")).rejects.toThrow(
+        TenantAuthorizationError
+      );
     });
   });
 
   describe("Cancel Invitation", () => {
-    it("owner or admin can cancel pending invitation", async () => {
+    it("owner or admin can cancel pending invitation via BetterAuth API", async () => {
       const targetInv = {
         id: "inv_123",
         organizationId: "org_alpha",
@@ -316,34 +370,42 @@ describe("Invitation Application Service Tests (Step F)", () => {
         status: "pending",
       };
 
-      let canceledStatus: string | null = null;
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([targetInv]),
           }),
         }),
-        update: () => ({
-          set: (vals: { status: string }) => {
-            canceledStatus = vals.status;
-            return {
-              where: () => Promise.resolve(),
-            };
-          },
-        }),
         insert: () => ({
           values: () => Promise.resolve(),
         }),
+        update: vi.fn(),
+        delete: vi.fn(),
       } as unknown as DbClient;
 
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn(),
+        cancelInvitation: vi.fn().mockResolvedValue({}),
+      };
+
       const auditHook = vi.fn();
-      const service = new InvitationService({ dbClient: mockDb, auditHook });
+      const service = new InvitationService({
+        dbClient: mockDb,
+        auditHook,
+        authApi: mockAuthApi,
+      });
       const ctx = makeContext("admin");
 
       await service.cancelInvitation(ctx, "org_alpha", "inv_123");
 
-      expect(canceledStatus).toBe("canceled");
+      expect(mockAuthApi.cancelInvitation).toHaveBeenCalledWith({
+        body: {
+          invitationId: "inv_123",
+        },
+        headers: undefined,
+      });
+      // Direct Drizzle update on BetterAuth invitation table MUST NOT be invoked
+      expect(mockDb.update).not.toHaveBeenCalled();
       expect(auditHook).toHaveBeenCalledWith(
         expect.objectContaining({
           eventType: "invitation.canceled",
@@ -361,7 +423,6 @@ describe("Invitation Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([acceptedInv]),
@@ -369,17 +430,22 @@ describe("Invitation Application Service Tests (Step F)", () => {
         }),
       } as unknown as DbClient;
 
-      const service = new InvitationService({ dbClient: mockDb });
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn(),
+        cancelInvitation: vi.fn(),
+      };
+
+      const service = new InvitationService({ dbClient: mockDb, authApi: mockAuthApi });
       const ctx = makeContext("owner");
 
       await expect(service.cancelInvitation(ctx, "org_alpha", "inv_123")).rejects.toThrow(
         ConflictError
       );
+      expect(mockAuthApi.cancelInvitation).not.toHaveBeenCalled();
     });
 
     it("rejects canceling foreign tenant invitation", async () => {
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([]), // not found in this org
@@ -395,7 +461,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
       );
     });
 
-    it("rolls back invitation cancellation when transactional audit persistence fails", async () => {
+    it("surfaces error when audit persistence fails after BetterAuth invitation cancellation", async () => {
       const targetInv = {
         id: "inv_123",
         organizationId: "org_alpha",
@@ -404,18 +470,17 @@ describe("Invitation Application Service Tests (Step F)", () => {
       };
 
       const mockDb = {
-        transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
           from: () => ({
             where: () => Promise.resolve([targetInv]),
           }),
         }),
-        update: () => ({
-          set: () => ({
-            where: () => Promise.resolve(),
-          }),
-        }),
       } as unknown as DbClient;
+
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn(),
+        cancelInvitation: vi.fn().mockResolvedValue({}),
+      };
 
       const failingAuditService = {
         recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
@@ -423,6 +488,7 @@ describe("Invitation Application Service Tests (Step F)", () => {
 
       const service = new InvitationService({
         dbClient: mockDb,
+        authApi: mockAuthApi,
         auditService: failingAuditService as unknown as InstanceType<
           typeof import("@/server/services/audit-service").AuditService
         >,
@@ -432,6 +498,52 @@ describe("Invitation Application Service Tests (Step F)", () => {
       await expect(service.cancelInvitation(ctx, "org_alpha", "inv_123")).rejects.toThrow(
         "Audit DB down"
       );
+      expect(mockAuthApi.cancelInvitation).toHaveBeenCalledTimes(1);
+    });
+
+    it("surfaces error when audit persistence fails after BetterAuth invitation creation", async () => {
+      const mockDb = {
+        select: () => ({
+          from: () => ({
+            where: () => Promise.resolve([]),
+          }),
+        }),
+      } as unknown as DbClient;
+
+      const mockAuthApi: BetterAuthInvitationApi = {
+        createInvitation: vi.fn().mockResolvedValue({
+          id: "inv_fail_123",
+          email: "fail_invitee@example.com",
+          role: "scientist",
+          organizationId: "org_alpha",
+          inviterId: "usr_actor",
+          status: "pending",
+          expiresAt: new Date(),
+        }),
+        cancelInvitation: vi.fn(),
+      };
+
+      const failingAuditService = {
+        recordUserAuditEvent: vi.fn().mockRejectedValue(new Error("Audit DB down")),
+      };
+
+      const service = new InvitationService({
+        dbClient: mockDb,
+        authApi: mockAuthApi,
+        auditService: failingAuditService as unknown as InstanceType<
+          typeof import("@/server/services/audit-service").AuditService
+        >,
+      });
+      const ctx = makeContext("owner", "org_alpha");
+
+      await expect(
+        service.createInvitation(ctx, "org_alpha", {
+          email: "fail_invitee@example.com",
+          role: "scientist",
+        })
+      ).rejects.toThrow("Audit DB down");
+
+      expect(mockAuthApi.createInvitation).toHaveBeenCalledTimes(1);
     });
   });
 });
