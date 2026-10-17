@@ -8,6 +8,13 @@
       "when": 1792220737702,
       "tag": "0000_phase1_identity_and_tenancy",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1792222278303,
+      "tag": "0001_member_organization_user_unique",
+      "breakpoints": true
     }
   ]
 }

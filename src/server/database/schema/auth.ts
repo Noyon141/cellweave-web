@@ -1,5 +1,5 @@
 import { relations, sql } from "drizzle-orm";
-import { pgTable, text, timestamp, boolean, index, check } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, index, check, unique } from "drizzle-orm/pg-core";
 
 export const user = pgTable("user", {
   id: text("id").primaryKey(),
@@ -99,6 +99,7 @@ export const member = pgTable(
   (table) => [
     index("member_organizationId_idx").on(table.organizationId),
     index("member_userId_idx").on(table.userId),
+    unique("member_organization_user_unique").on(table.organizationId, table.userId),
     check(
       "member_role_check",
       sql`${table.role} IN ('owner', 'admin', 'bioinformatician', 'scientist', 'viewer')`

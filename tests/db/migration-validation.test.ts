@@ -284,4 +284,22 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       expect(sql).not.toMatch(/DROP COLUMN/i);
     });
   });
+
+  describe("Hardening Migration 0001 Validation", () => {
+    const hardeningMigrationPath = path.resolve(
+      process.cwd(),
+      "src/server/database/migrations/0001_member_organization_user_unique.sql"
+    );
+
+    it("verifies 0001 migration file exists and is readable", () => {
+      expect(fs.existsSync(hardeningMigrationPath)).toBe(true);
+    });
+
+    it("verifies 0001 migration adds member_organization_user_unique constraint", () => {
+      const sql = fs.readFileSync(hardeningMigrationPath, "utf-8");
+      expect(sql).toContain(
+        'CONSTRAINT "member_organization_user_unique" UNIQUE("organization_id","user_id")'
+      );
+    });
+  });
 });
