@@ -5,7 +5,10 @@ export default defineConfig({
   out: "./src/server/database/migrations",
   dialect: "postgresql",
   dbCredentials: {
-    url: process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/cellweave_dev",
+    url:
+      process.env.DATABASE_MIGRATION_URL ||
+      process.env.DATABASE_URL ||
+      "postgresql://postgres:postgres@localhost:5432/cellweave_dev",
   },
   strict: true,
   verbose: true,
