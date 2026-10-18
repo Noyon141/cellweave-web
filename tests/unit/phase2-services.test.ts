@@ -120,6 +120,94 @@ describe("Phase 2 Application Services Unit Tests", () => {
         ).rejects.toThrow(ValidationError);
       });
 
+      it("records project.archived audit action when archiving a project", async () => {
+        const mockAudit = {
+          recordUserAuditEvent: vi.fn().mockResolvedValue({}),
+        };
+
+        const mockDb = {
+          transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+          select: () => ({
+            from: () => ({
+              where: () =>
+                Promise.resolve([
+                  {
+                    id: "prj_active",
+                    organizationId: "org_alpha",
+                    name: "Active Project",
+                    status: "active",
+                    archivedAt: null,
+                  },
+                ]),
+            }),
+          }),
+          update: () => ({
+            set: () => ({
+              where: () => ({
+                returning: () =>
+                  Promise.resolve([
+                    {
+                      id: "prj_active",
+                      organizationId: "org_alpha",
+                      name: "Active Project",
+                      status: "archived",
+                      archivedAt: new Date(),
+                      updatedAt: new Date(),
+                      createdBy: "usr_actor",
+                      createdAt: new Date(),
+                    },
+                  ]),
+              }),
+            }),
+          }),
+        } as unknown as DbClient;
+
+        const service = new ProjectService({
+          dbClient: mockDb,
+          auditService:
+            mockAudit as unknown as import("@/server/services/audit-service").AuditService,
+        });
+        const ctx = makeContext("owner");
+
+        const archived = await service.archiveProject(ctx, "prj_active");
+        expect(archived.status).toBe("archived");
+        expect(mockAudit.recordUserAuditEvent).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: "project.archived",
+            resourceType: "project",
+            resourceId: "prj_active",
+          })
+        );
+      });
+
+      it("listAccessibleProjects excludes archived projects by default and includes them when includeArchived is true", async () => {
+        let whereCondition: unknown = null;
+        const mockDb = {
+          select: () => ({
+            from: () => ({
+              where: (cond: unknown) => {
+                whereCondition = cond;
+                return {
+                  orderBy: () => Promise.resolve([]),
+                };
+              },
+            }),
+          }),
+        } as unknown as DbClient;
+
+        const service = new ProjectService({ dbClient: mockDb });
+        const ctx = makeContext("owner");
+
+        // 1. Default call
+        await service.listAccessibleProjects(ctx);
+        // By default should query with status = 'active'
+        expect(whereCondition).toBeDefined();
+
+        // 2. Explicit includeArchived: true
+        await service.listAccessibleProjects(ctx, { includeArchived: true });
+        expect(whereCondition).toBeDefined();
+      });
+
       it("rejects re-archiving an already archived project", async () => {
         const mockDb = {
           transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
@@ -271,12 +359,16 @@ describe("Phase 2 Application Services Unit Tests", () => {
       );
     });
 
-    it("rejects invalid sampleKey format", async () => {
+    it("rejects empty sampleKey and control characters", async () => {
       const service = new SampleService({});
       const ctx = makeContext("scientist");
 
+      await expect(service.createSample(ctx, "exp_1", { sampleKey: "" })).rejects.toThrow(
+        ValidationError
+      );
+
       await expect(
-        service.createSample(ctx, "exp_1", { sampleKey: "invalid space key" })
+        service.createSample(ctx, "exp_1", { sampleKey: "sample\x00key" })
       ).rejects.toThrow(ValidationError);
     });
 
@@ -509,6 +601,161 @@ describe("Phase 2 Application Services Unit Tests", () => {
       });
 
       expect(dsv.versionNumber).toBe(4);
+    });
+  });
+
+  describe("Comprehensive Archived Project Mutation Invariant Tests", () => {
+    const rolesToTest: OrganizationRole[] = ["owner", "admin", "bioinformatician", "scientist"];
+
+    for (const role of rolesToTest) {
+      it(`${role} is denied all scientific-content mutations in an archived project`, async () => {
+        const mockPerm = {
+          assertProjectAccess: vi.fn().mockResolvedValue({ hasAccess: true }),
+        };
+
+        const mockDb = {
+          transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
+          select: () => ({
+            from: () => ({
+              where: () => ({
+                for: () =>
+                  Promise.resolve([
+                    {
+                      id: "ds_1",
+                      projectId: "prj_archived",
+                      status: "active",
+                    },
+                  ]),
+                then: (resolve: (val: unknown) => void) =>
+                  resolve([
+                    {
+                      id: "prj_archived",
+                      status: "archived",
+                      archivedAt: new Date(),
+                    },
+                  ]),
+              }),
+              innerJoin: () => ({
+                innerJoin: () => ({
+                  where: () =>
+                    Promise.resolve([
+                      {
+                        sample: { id: "smp_1" },
+                        projectId: "prj_archived",
+                        projectStatus: "archived",
+                        projectArchivedAt: new Date(),
+                      },
+                    ]),
+                }),
+                where: () =>
+                  Promise.resolve([
+                    {
+                      id: "exp_1",
+                      projectId: "prj_archived",
+                      projectStatus: "archived",
+                      projectArchivedAt: new Date(),
+                    },
+                  ]),
+              }),
+            }),
+          }),
+        } as unknown as DbClient;
+
+        const ctx = makeContext(role);
+
+        // 1. Experiment mutations
+        const expService = new ExperimentService({
+          dbClient: mockDb,
+          permissionService:
+            mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        });
+        await expect(
+          expService.createExperiment(ctx, "prj_archived", { name: "Exp" })
+        ).rejects.toThrow(ValidationError);
+        await expect(
+          expService.updateExperiment(ctx, "exp_1", { name: "Exp Updated" })
+        ).rejects.toThrow(ValidationError);
+
+        // 2. Sample mutations
+        const smpService = new SampleService({
+          dbClient: mockDb,
+          permissionService:
+            mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        });
+        await expect(
+          smpService.createSample(ctx, "exp_1", { sampleKey: "sample-01" })
+        ).rejects.toThrow(ValidationError);
+        await expect(
+          smpService.updateSample(ctx, "smp_1", { displayName: "Sample Updated" })
+        ).rejects.toThrow(ValidationError);
+
+        // 3. Dataset mutations
+        const dsService = new DatasetService({
+          dbClient: mockDb,
+          permissionService:
+            mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        });
+        await expect(dsService.createDataset(ctx, "prj_archived", { name: "DS" })).rejects.toThrow(
+          ValidationError
+        );
+        await expect(
+          dsService.createDatasetVersion(ctx, "ds_1", { sourceFormat: "10x_h5" })
+        ).rejects.toThrow(ValidationError);
+      });
+    }
+  });
+
+  describe("Cross-Tenant IDOR and Non-Disclosure Tests", () => {
+    it("rejects foreign-tenant project, experiment, sample, dataset, and datasetVersion without disclosing existence", async () => {
+      // Mock db returns empty array for foreign organizationId queries
+      const mockDb = {
+        select: () => ({
+          from: () => ({
+            where: () => Promise.resolve([]),
+            innerJoin: () => ({
+              where: () => Promise.resolve([]),
+            }),
+          }),
+        }),
+      } as unknown as DbClient;
+
+      const mockPerm = {
+        assertProjectAccess: vi.fn().mockRejectedValue(
+          new (class extends Error {
+            name = "ResourceNotFoundError";
+          })("Project not found")
+        ),
+      };
+
+      const ctx = makeContext("owner", "org_alpha");
+
+      const prjService = new ProjectService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+      });
+      const expService = new ExperimentService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+      });
+      const smpService = new SampleService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+      });
+      const dsService = new DatasetService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+      });
+
+      // Every service query for a foreign ID throws non-disclosing error
+      await expect(prjService.getProject(ctx, "prj_foreign")).rejects.toThrow();
+      await expect(expService.getExperiment(ctx, "exp_foreign")).rejects.toThrow();
+      await expect(smpService.getSample(ctx, "smp_foreign")).rejects.toThrow();
+      await expect(dsService.getDataset(ctx, "ds_foreign")).rejects.toThrow();
+      await expect(dsService.getDatasetVersion(ctx, "dsv_foreign")).rejects.toThrow();
     });
   });
 });

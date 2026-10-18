@@ -34,10 +34,7 @@ export const createSampleSchema = z.object({
     .trim()
     .min(1, "Sample key is required")
     .max(100, "Sample key cannot exceed 100 characters")
-    .regex(
-      /^[a-zA-Z0-9_-]+$/,
-      "Sample key must only contain alphanumeric characters, hyphens, and underscores"
-    ),
+    .refine((val) => !/[\x00-\x1F\x7F]/.test(val), "Sample key cannot contain control characters"),
   displayName: z
     .string()
     .trim()
