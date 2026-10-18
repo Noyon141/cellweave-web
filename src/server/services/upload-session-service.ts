@@ -11,6 +11,7 @@ import {
   ResourceNotFoundError,
   TenantAuthorizationError,
   ValidationError,
+  IntegrityError,
 } from "../authorization/errors";
 import { AuditService } from "./audit-service";
 import { ProjectPermissionService } from "./project-permission-service";
@@ -198,17 +199,22 @@ export function calculatePartPlan(expectedSize: number, requestedPartSize?: numb
  * 2. Role Authorization:
  *    - Upload mutations require role in [owner, admin, bioinformatician, scientist].
  *    - Viewer role is strictly read-only and prohibited from initiating, uploading, or completing.
- * 3. Authoritative State:
+ * 3. Canonical Lifecycle State Machine:
+ *    - CREATED -> UPLOADING -> UPLOADED -> VERIFYING -> VERIFIED.
+ *    - Conditional updates enforce state transitions and prevent skipping UPLOADED or VERIFYING.
+ * 4. Authoritative State:
  *    - R2 ListParts is the single source of truth for uploaded parts. No uploadedParts JSONB in DB.
- * 4. Compensating Actions:
+ * 5. Compensating Actions & Reconciliation:
  *    - Initiation failure after R2 multipart creation triggers best-effort abortMultipartUpload.
  *    - Completion failure after R2 CompleteMultipartUpload leaves session in recoverable VERIFYING state.
- *    - NoSuchUpload during resume reconciles via headObject.
- * 5. Data Privacy & Zero-Proxy:
+ *    - NoSuchUpload during resume/completion reconciles via headObject.
+ *    - Abort during VERIFYING or NoSuchUpload verifies headObject before aborting.
+ * 6. Data Privacy & Zero-Proxy:
  *    - Large scientific file bytes NEVER flow through Next.js or Vercel.
  *    - Clients upload directly to Cloudflare R2 using short-lived presigned URLs.
- * 6. Audit Logging:
+ * 7. Audit Logging Idempotency:
  *    - Records upload.initiated, upload.completed, and upload.aborted.
+ *    - Exactly one upload.completed audit event is produced upon initial VERIFIED transition.
  */
 export class UploadSessionService {
   private readonly db: DbClient;
@@ -251,6 +257,25 @@ export class UploadSessionService {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };
+  }
+
+  private async markSessionFailed(
+    organizationId: string,
+    sessionId: string,
+    failureCode: string,
+    failureSummary: string
+  ): Promise<void> {
+    await this.db
+      .update(uploadSessions)
+      .set({
+        status: "FAILED",
+        failureCode,
+        failureSummary,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(eq(uploadSessions.id, sessionId), eq(uploadSessions.organizationId, organizationId))
+      );
   }
 
   /**
@@ -453,13 +478,36 @@ export class UploadSessionService {
 
     await this.permissionService.assertProjectAccess(context, session.projectId);
 
-    // If expired and currently in non-terminal state, transition to EXPIRED
+    // If expired and currently in non-terminal state, reconcile before expiring
     if (
       session.expiresAt <= new Date() &&
       (session.status === "CREATED" ||
         session.status === "UPLOADING" ||
         session.status === "UPLOADED")
     ) {
+      // Check if physical object was already completed in R2
+      try {
+        const head = await this.storageService.headObject({ objectKey: session.r2Key });
+        if (head && head.contentLength === session.expectedSize) {
+          // Completed object exists! Do NOT expire blindly; route to VERIFYING for completion reconciliation
+          const now = new Date();
+          await this.db
+            .update(uploadSessions)
+            .set({ status: "VERIFYING", updatedAt: now })
+            .where(
+              and(
+                eq(uploadSessions.id, session.id),
+                eq(uploadSessions.organizationId, context.organizationId)
+              )
+            );
+          session.status = "VERIFYING";
+          session.updatedAt = now;
+          return this.mapSessionRow(session);
+        }
+      } catch {
+        // HeadObject check failure; proceed to expire
+      }
+
       const now = new Date();
       await this.db
         .update(uploadSessions)
@@ -574,21 +622,12 @@ export class UploadSessionService {
         }
 
         // Upload lost or aborted in provider
-        const now = new Date();
-        await this.db
-          .update(uploadSessions)
-          .set({
-            status: "FAILED",
-            failureCode: "R2_UPLOAD_NOT_FOUND",
-            failureSummary: "Multipart upload was not found in R2 and object does not exist",
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(uploadSessions.id, session.id),
-              eq(uploadSessions.organizationId, context.organizationId)
-            )
-          );
+        await this.markSessionFailed(
+          context.organizationId,
+          session.id,
+          "R2_UPLOAD_NOT_FOUND",
+          "Multipart upload was not found in R2 and object does not exist"
+        );
 
         return {
           sessionId: session.id,
@@ -599,6 +638,11 @@ export class UploadSessionService {
           uploadedParts: [],
           missingParts: [],
         };
+      }
+
+      // Transient provider errors must not mark FAILED
+      if (error instanceof StorageError && error.isRetryable) {
+        throw error;
       }
 
       throw error;
@@ -697,15 +741,21 @@ export class UploadSessionService {
   /**
    * Finalizes the upload session once all parts have been uploaded to R2.
    *
-   * Idempotency & Invariants:
-   * 1. Authoritative verification: Checks R2 ListParts to verify all parts 1..totalParts exist.
-   * 2. Transitions status to VERIFYING prior to CompleteMultipartUpload.
-   * 3. Executes CompleteMultipartUpload and HeadObject verification.
-   * 4. Inside a PostgreSQL transaction:
-   *    - Inserts dataset_files record.
-   *    - Transitions upload_sessions to VERIFIED.
-   *    - Records upload.completed audit event.
-   * 5. If already VERIFIED, returns existing DTO idempotently without duplicating R2 calls or audit records.
+   * Locked Canonical Lifecycle:
+   * CREATED -> UPLOADING -> UPLOADED -> VERIFYING -> VERIFIED
+   *
+   * Invariants & Rules:
+   * 1. If called while CREATED, reconciles R2 ListParts and steps through valid lifecycle.
+   * 2. After ListParts proves all parts exist:
+   *    - Conditionally transitions UPLOADING -> UPLOADED.
+   *    - Conditionally transitions UPLOADED -> VERIFYING.
+   *    - Never skips UPLOADED or VERIFYING.
+   * 3. CompleteMultipartUpload executed in VERIFYING state.
+   * 4. If already VERIFIED, returns existing DTO without calling R2 or writing duplicate audit events.
+   * 5. If NoSuchUpload occurs:
+   *    - Reconciles via HeadObject. If object exists and matches size, continues to binding.
+   *    - If absent or size mismatch, marks FAILED.
+   * 6. Transient provider errors (PROVIDER_UNAVAILABLE, isRetryable: true) do NOT mark FAILED.
    */
   async completeUpload(
     context: TenantContext,
@@ -714,7 +764,7 @@ export class UploadSessionService {
   ): Promise<CompleteUploadResultDTO> {
     this.assertCanMutate(context);
 
-    const session = await this.getUploadSession(context, sessionId);
+    let session = await this.getUploadSession(context, sessionId);
 
     // 1. Idempotent short-circuit if already VERIFIED
     if (session.status === "VERIFIED") {
@@ -759,11 +809,29 @@ export class UploadSessionService {
       );
     }
 
-    if (session.expiresAt <= new Date()) {
+    if (session.expiresAt <= new Date() && session.status !== "VERIFYING") {
       throw new ValidationError("Upload session has expired");
     }
 
-    // 2. Authoritative check: verify all parts are present in R2
+    // 2. Reconciliation path if already VERIFYING (e.g. from prior interrupted attempt)
+    if (session.status === "VERIFYING") {
+      const head = await this.storageService.headObject({ objectKey: session.r2Key });
+      if (head && head.contentLength === session.expectedSize) {
+        return await this.bindCompletedDatasetFile(context, session, head, options);
+      } else if (head && head.contentLength !== session.expectedSize) {
+        await this.markSessionFailed(
+          context.organizationId,
+          session.id,
+          "SIZE_MISMATCH",
+          `Expected ${session.expectedSize} bytes, got ${head.contentLength} bytes`
+        );
+        throw new ValidationError(
+          `Uploaded object size (${head.contentLength}) does not match expected size (${session.expectedSize})`
+        );
+      }
+    }
+
+    // 3. Authoritative check: verify all parts are present in R2
     let r2Parts: readonly { partNumber: number; eTag: string }[];
     try {
       r2Parts = await this.storageService.listMultipartParts({
@@ -775,10 +843,48 @@ export class UploadSessionService {
       if (error instanceof StorageError && error.code === "MULTIPART_UPLOAD_NOT_FOUND") {
         const head = await this.storageService.headObject({ objectKey: session.r2Key });
         if (head && head.contentLength === session.expectedSize) {
-          // Object already finalized in R2; proceed to DB binding
+          // Object already finalized in R2; advance to VERIFYING if needed and bind
+          if (session.status !== "VERIFYING") {
+            await this.db
+              .update(uploadSessions)
+              .set({ status: "VERIFYING", updatedAt: new Date() })
+              .where(
+                and(
+                  eq(uploadSessions.id, session.id),
+                  eq(uploadSessions.organizationId, context.organizationId)
+                )
+              );
+            session = { ...session, status: "VERIFYING" };
+          }
           return await this.bindCompletedDatasetFile(context, session, head, options);
+        } else if (head && head.contentLength !== session.expectedSize) {
+          await this.markSessionFailed(
+            context.organizationId,
+            session.id,
+            "SIZE_MISMATCH",
+            `Expected ${session.expectedSize} bytes, got ${head.contentLength} bytes`
+          );
+          throw new ValidationError(
+            `Uploaded object size (${head.contentLength}) does not match expected size (${session.expectedSize})`
+          );
+        } else {
+          await this.markSessionFailed(
+            context.organizationId,
+            session.id,
+            "R2_UPLOAD_NOT_FOUND",
+            "Multipart upload was not found in storage and assembled object does not exist"
+          );
+          throw new ValidationError(
+            "Multipart upload was not found in storage and assembled object does not exist"
+          );
         }
       }
+
+      // Transient provider errors must not mark FAILED
+      if (error instanceof StorageError && error.isRetryable) {
+        throw error;
+      }
+
       throw error;
     }
 
@@ -798,76 +904,121 @@ export class UploadSessionService {
       );
     }
 
-    // 3. Conditional update to VERIFYING
-    await this.db
-      .update(uploadSessions)
-      .set({ status: "VERIFYING", updatedAt: new Date() })
-      .where(
-        and(
-          eq(uploadSessions.id, session.id),
-          eq(uploadSessions.organizationId, context.organizationId),
-          inArray(uploadSessions.status, ["CREATED", "UPLOADING", "UPLOADED", "VERIFYING"])
-        )
-      );
+    // 4. Canonical State Machine Progression:
+    // CREATED -> UPLOADING -> UPLOADED -> VERIFYING -> VERIFIED
+    // Must not skip UPLOADED or VERIFYING.
 
-    // 4. Complete multipart upload in R2
-    const completeResult = await this.storageService.completeMultipartUpload({
-      objectKey: session.r2Key,
-      uploadId: session.r2UploadId,
-      parts: r2Parts.map((p) => ({ partNumber: p.partNumber, eTag: p.eTag })),
-    });
-
-    // 5. Verify assembled object in R2 via HeadObject
-    const head = await this.storageService.headObject({ objectKey: session.r2Key });
-    if (!head) {
-      const now = new Date();
+    // A. CREATED -> UPLOADING (if called from CREATED with all parts already uploaded)
+    if (session.status === "CREATED") {
       await this.db
         .update(uploadSessions)
-        .set({
-          status: "FAILED",
-          failureCode: "OBJECT_NOT_FOUND_AFTER_COMPLETION",
-          failureSummary: "Object could not be found in storage following multipart completion",
-          updatedAt: now,
-        })
+        .set({ status: "UPLOADING", updatedAt: new Date() })
         .where(
           and(
             eq(uploadSessions.id, session.id),
-            eq(uploadSessions.organizationId, context.organizationId)
+            eq(uploadSessions.organizationId, context.organizationId),
+            eq(uploadSessions.status, "CREATED")
           )
         );
+      session = { ...session, status: "UPLOADING" };
+    }
+
+    // B. UPLOADING -> UPLOADED
+    if (session.status === "UPLOADING") {
+      await this.db
+        .update(uploadSessions)
+        .set({ status: "UPLOADED", updatedAt: new Date() })
+        .where(
+          and(
+            eq(uploadSessions.id, session.id),
+            eq(uploadSessions.organizationId, context.organizationId),
+            eq(uploadSessions.status, "UPLOADING")
+          )
+        );
+      session = { ...session, status: "UPLOADED" };
+    }
+
+    // C. UPLOADED -> VERIFYING
+    if (session.status === "UPLOADED") {
+      await this.db
+        .update(uploadSessions)
+        .set({ status: "VERIFYING", updatedAt: new Date() })
+        .where(
+          and(
+            eq(uploadSessions.id, session.id),
+            eq(uploadSessions.organizationId, context.organizationId),
+            eq(uploadSessions.status, "UPLOADED")
+          )
+        );
+      session = { ...session, status: "VERIFYING" };
+    }
+
+    // 5. Complete multipart upload in R2
+    let completeResult: { eTag: string } | null = null;
+    try {
+      completeResult = await this.storageService.completeMultipartUpload({
+        objectKey: session.r2Key,
+        uploadId: session.r2UploadId,
+        parts: r2Parts.map((p) => ({ partNumber: p.partNumber, eTag: p.eTag })),
+      });
+    } catch (completeErr) {
+      if (
+        completeErr instanceof StorageError &&
+        completeErr.code === "MULTIPART_UPLOAD_NOT_FOUND"
+      ) {
+        // Multipart upload already completed or finalized; verify via HeadObject below
+      } else if (completeErr instanceof StorageError && completeErr.isRetryable) {
+        // Transient error: do NOT mark FAILED. Session remains in VERIFYING for retry.
+        throw completeErr;
+      } else {
+        throw completeErr;
+      }
+    }
+
+    // 6. Verify assembled object in R2 via HeadObject
+    const head = await this.storageService.headObject({ objectKey: session.r2Key });
+    if (!head) {
+      await this.markSessionFailed(
+        context.organizationId,
+        session.id,
+        "OBJECT_NOT_FOUND_AFTER_COMPLETION",
+        "Object could not be found in storage following multipart completion"
+      );
       throw new Error("Object was not found in storage after multipart completion");
     }
 
     if (head.contentLength !== session.expectedSize) {
-      const now = new Date();
-      await this.db
-        .update(uploadSessions)
-        .set({
-          status: "FAILED",
-          failureCode: "SIZE_MISMATCH",
-          failureSummary: `Expected ${session.expectedSize} bytes, got ${head.contentLength} bytes`,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(uploadSessions.id, session.id),
-            eq(uploadSessions.organizationId, context.organizationId)
-          )
-        );
+      await this.markSessionFailed(
+        context.organizationId,
+        session.id,
+        "SIZE_MISMATCH",
+        `Expected ${session.expectedSize} bytes, got ${head.contentLength} bytes`
+      );
       throw new ValidationError(
         `Uploaded object size (${head.contentLength}) does not match expected size (${session.expectedSize})`
       );
     }
 
-    // 6. Bind completed dataset_files and update upload_sessions inside DB transaction
+    // 7. Bind completed dataset_files and update upload_sessions inside DB transaction
     return await this.bindCompletedDatasetFile(
       context,
       session,
-      { ...head, eTag: completeResult.eTag || head.eTag },
+      { ...head, eTag: completeResult?.eTag || head.eTag },
       options
     );
   }
 
+  /**
+   * Binds the verified physical R2 object to dataset_files and finalizes upload_sessions to VERIFIED.
+   *
+   * Idempotency & Invariants:
+   * 1. Checks existing dataset_files binding.
+   * 2. If present, validates immutable consistency (organizationId, datasetVersionId, r2Key, byteSize, eTag).
+   *    If mismatching, raises IntegrityError.
+   * 3. If insert encounters conflict, re-reads row and validates immutable consistency.
+   * 4. Transitions upload_sessions from VERIFYING -> VERIFIED.
+   * 5. The transaction that first establishes VERIFYING -> VERIFIED emits upload.completed audit event.
+   */
   private async bindCompletedDatasetFile(
     context: TenantContext,
     session: UploadSessionDTO,
@@ -879,46 +1030,99 @@ export class UploadSessionService {
     const fileName = session.r2Key.split("/").pop() ?? "file";
 
     return await this.db.transaction(async (tx) => {
-      // Insert dataset_files record (on conflict do nothing if retrying)
-      const insertedFiles = await tx
-        .insert(datasetFiles)
-        .values({
-          id: fileId,
-          organizationId: context.organizationId,
-          datasetVersionId: session.datasetVersionId,
-          r2Key: session.r2Key,
-          byteSize: head.contentLength,
-          fileName,
-          contentType: head.contentType ?? "application/octet-stream",
-          eTag: head.eTag,
-          createdAt: now,
-        })
-        .onConflictDoNothing({
-          target: [datasetFiles.datasetVersionId, datasetFiles.r2Key],
-        })
-        .returning();
+      // 1. Query existing dataset_files
+      const existingFiles = await tx
+        .select()
+        .from(datasetFiles)
+        .where(
+          and(
+            eq(datasetFiles.datasetVersionId, session.datasetVersionId),
+            eq(datasetFiles.r2Key, session.r2Key)
+          )
+        );
 
       let activeFile: typeof datasetFiles.$inferSelect;
-      if (insertedFiles[0]) {
-        activeFile = insertedFiles[0];
-      } else {
-        const existing = await tx
-          .select()
-          .from(datasetFiles)
-          .where(
-            and(
-              eq(datasetFiles.datasetVersionId, session.datasetVersionId),
-              eq(datasetFiles.r2Key, session.r2Key),
-              eq(datasetFiles.organizationId, context.organizationId)
-            )
+      const existing = existingFiles[0];
+
+      if (existing) {
+        // Validate immutable consistency
+        if (
+          existing.organizationId !== context.organizationId ||
+          existing.datasetVersionId !== session.datasetVersionId ||
+          existing.r2Key !== session.r2Key ||
+          existing.byteSize !== head.contentLength
+        ) {
+          throw new IntegrityError(
+            `Immutable dataset file mismatch for key ${session.r2Key}: existing byteSize=${existing.byteSize}, expected=${head.contentLength}`
           );
-        if (!existing[0]) {
-          throw new Error("Failed to insert or resolve dataset file binding");
         }
-        activeFile = existing[0];
+        if (head.eTag && existing.eTag && existing.eTag !== head.eTag) {
+          throw new IntegrityError(
+            `Immutable dataset file ETag mismatch for key ${session.r2Key}: existing=${existing.eTag}, expected=${head.eTag}`
+          );
+        }
+        activeFile = existing;
+      } else {
+        // Attempt INSERT
+        try {
+          const inserted = await tx
+            .insert(datasetFiles)
+            .values({
+              id: fileId,
+              organizationId: context.organizationId,
+              datasetVersionId: session.datasetVersionId,
+              r2Key: session.r2Key,
+              byteSize: head.contentLength,
+              fileName,
+              contentType: head.contentType ?? "application/octet-stream",
+              eTag: head.eTag,
+              createdAt: now,
+            })
+            .returning();
+
+          const created = inserted[0];
+          if (!created) {
+            throw new Error("Failed to insert dataset file binding");
+          }
+          activeFile = created;
+        } catch (insertError) {
+          // Retry race: another transaction inserted first
+          const reRead = await tx
+            .select()
+            .from(datasetFiles)
+            .where(
+              and(
+                eq(datasetFiles.datasetVersionId, session.datasetVersionId),
+                eq(datasetFiles.r2Key, session.r2Key)
+              )
+            );
+
+          const conflictRow = reRead[0];
+          if (!conflictRow) {
+            throw insertError;
+          }
+
+          // Validate immutable consistency on conflicting row
+          if (
+            conflictRow.organizationId !== context.organizationId ||
+            conflictRow.datasetVersionId !== session.datasetVersionId ||
+            conflictRow.r2Key !== session.r2Key ||
+            conflictRow.byteSize !== head.contentLength
+          ) {
+            throw new IntegrityError(
+              `Immutable dataset file conflict mismatch for key ${session.r2Key}: existing byteSize=${conflictRow.byteSize}, expected=${head.contentLength}`
+            );
+          }
+          if (head.eTag && conflictRow.eTag && conflictRow.eTag !== head.eTag) {
+            throw new IntegrityError(
+              `Immutable dataset file conflict ETag mismatch for key ${session.r2Key}: existing=${conflictRow.eTag}, expected=${head.eTag}`
+            );
+          }
+          activeFile = conflictRow;
+        }
       }
 
-      // Finalize upload_sessions row
+      // 2. Finalize upload_sessions row (conditional transition VERIFYING -> VERIFIED)
       const updatedSessions = await tx
         .update(uploadSessions)
         .set({
@@ -930,37 +1134,57 @@ export class UploadSessionService {
         .where(
           and(
             eq(uploadSessions.id, session.id),
-            eq(uploadSessions.organizationId, context.organizationId)
+            eq(uploadSessions.organizationId, context.organizationId),
+            eq(uploadSessions.status, "VERIFYING")
           )
         )
         .returning();
 
-      const updatedSession = updatedSessions[0];
-      if (!updatedSession) {
-        throw new Error("Failed to finalize upload session record");
+      let finalizedSession: UploadSessionDTO;
+
+      if (updatedSessions[0]) {
+        // This transaction successfully transitioned VERIFYING -> VERIFIED!
+        // It owns the emission of the upload.completed audit event.
+        finalizedSession = this.mapSessionRow(updatedSessions[0]);
+
+        await this.auditService.recordUserAuditEvent({
+          db: tx,
+          context,
+          action: "upload.completed",
+          resourceType: "upload_session",
+          resourceId: session.id,
+          metadata: {
+            projectId: session.projectId,
+            datasetVersionId: session.datasetVersionId,
+            r2Key: session.r2Key,
+            byteSize: head.contentLength,
+            eTag: head.eTag,
+          },
+          clientIp: options?.requestMetadata?.clientIp,
+          userAgent: options?.requestMetadata?.userAgent,
+          timestamp: now,
+        });
+      } else {
+        // Already transitioned to VERIFIED by a concurrent or prior commit
+        const currentSession = await tx
+          .select()
+          .from(uploadSessions)
+          .where(
+            and(
+              eq(uploadSessions.id, session.id),
+              eq(uploadSessions.organizationId, context.organizationId)
+            )
+          );
+
+        if (!currentSession[0] || currentSession[0].status !== "VERIFIED") {
+          throw new Error("Failed to finalize upload session in VERIFIED status");
+        }
+        finalizedSession = this.mapSessionRow(currentSession[0]);
+        // Do NOT emit a duplicate upload.completed audit event
       }
 
-      // Record upload.completed audit event
-      await this.auditService.recordUserAuditEvent({
-        db: tx,
-        context,
-        action: "upload.completed",
-        resourceType: "upload_session",
-        resourceId: session.id,
-        metadata: {
-          projectId: session.projectId,
-          datasetVersionId: session.datasetVersionId,
-          r2Key: session.r2Key,
-          byteSize: head.contentLength,
-          eTag: head.eTag,
-        },
-        clientIp: options?.requestMetadata?.clientIp,
-        userAgent: options?.requestMetadata?.userAgent,
-        timestamp: now,
-      });
-
       return {
-        session: this.mapSessionRow(updatedSession),
+        session: finalizedSession,
         file: {
           id: activeFile.id,
           organizationId: activeFile.organizationId,
@@ -978,6 +1202,12 @@ export class UploadSessionService {
 
   /**
    * Aborts an active upload session and cleans up incomplete parts in R2.
+   *
+   * Invariants:
+   * 1. VERIFYING abort rule: Does NOT allow blind abort while in VERIFYING status.
+   *    Performs HeadObject reconciliation first.
+   * 2. If provider returns MULTIPART_UPLOAD_NOT_FOUND, checks HeadObject before marking ABORTED.
+   * 3. Never converts a completed physical object into an ABORTED logical session.
    */
   async abortUpload(
     context: TenantContext,
@@ -998,15 +1228,46 @@ export class UploadSessionService {
       );
     }
 
-    // Best-effort abort in R2
+    // VERIFYING abort guard: physical completion may already have occurred
+    if (session.status === "VERIFYING") {
+      const head = await this.storageService.headObject({ objectKey: session.r2Key });
+      if (head && head.contentLength === session.expectedSize) {
+        throw new ConflictError(
+          "Cannot abort upload session: upload has already completed in storage"
+        );
+      } else if (head && head.contentLength !== session.expectedSize) {
+        throw new IntegrityError(
+          `Storage object exists with mismatched size (${head.contentLength} vs expected ${session.expectedSize}) during abort`
+        );
+      }
+      // Object not completed; proceed with abort attempt
+    }
+
+    // Attempt provider abort in R2
     try {
       await this.storageService.abortMultipartUpload({
         objectKey: session.r2Key,
         uploadId: session.r2UploadId,
       });
     } catch (error) {
-      if (!(error instanceof StorageError && error.code === "MULTIPART_UPLOAD_NOT_FOUND")) {
-        // Log or suppress non-fatal provider abort errors
+      if (error instanceof StorageError && error.code === "MULTIPART_UPLOAD_NOT_FOUND") {
+        // NoSuchUpload: inspect if object already exists
+        const head = await this.storageService.headObject({ objectKey: session.r2Key });
+        if (head && head.contentLength === session.expectedSize) {
+          throw new ConflictError(
+            "Cannot abort upload session: upload has already completed in storage"
+          );
+        } else if (head && head.contentLength !== session.expectedSize) {
+          throw new IntegrityError(
+            `Storage object exists with mismatched size (${head.contentLength} vs expected ${session.expectedSize}) during abort`
+          );
+        }
+        // Object does not exist in storage: safe to proceed with abort
+      } else if (error instanceof StorageError && error.isRetryable) {
+        // Transient error: do NOT mark ABORTED, allow caller to retry
+        throw error;
+      } else {
+        // Other non-fatal errors during abort can be logged/suppressed or rethrown
       }
     }
 
@@ -1020,14 +1281,28 @@ export class UploadSessionService {
       .where(
         and(
           eq(uploadSessions.id, session.id),
-          eq(uploadSessions.organizationId, context.organizationId)
+          eq(uploadSessions.organizationId, context.organizationId),
+          inArray(uploadSessions.status, ["CREATED", "UPLOADING", "UPLOADED", "VERIFYING"])
         )
       )
       .returning();
 
     const updated = updatedRows[0];
     if (!updated) {
-      throw new Error("Failed to mark upload session as aborted");
+      // Re-read in case of concurrent abort
+      const reRead = await this.db
+        .select()
+        .from(uploadSessions)
+        .where(
+          and(
+            eq(uploadSessions.id, session.id),
+            eq(uploadSessions.organizationId, context.organizationId)
+          )
+        );
+      if (reRead[0] && reRead[0].status === "ABORTED") {
+        return this.mapSessionRow(reRead[0]);
+      }
+      throw new ConflictError("Failed to abort upload session due to concurrent state change");
     }
 
     await this.auditService.recordUserAuditEvent({
@@ -1050,6 +1325,10 @@ export class UploadSessionService {
 
   /**
    * Maintenance method to expire an upload session whose TTL has lapsed.
+   *
+   * Invariants:
+   * 1. Never expires VERIFYING, VERIFIED, or IMPORTED sessions.
+   * 2. Checks HeadObject before expiring: if completed object exists, does NOT expire.
    */
   async expireUploadSession(sessionId: string, organizationId: string): Promise<void> {
     const rows = await this.db
@@ -1062,13 +1341,33 @@ export class UploadSessionService {
     const session = rows[0];
     if (!session) return;
 
+    // Never expire VERIFYING, VERIFIED, or IMPORTED
     if (
+      session.status === "VERIFYING" ||
       session.status === "VERIFIED" ||
+      session.status === "IMPORTED" ||
       session.status === "ABORTED" ||
       session.status === "FAILED" ||
       session.status === "EXPIRED"
     ) {
       return;
+    }
+
+    // Inspect if object is already completed in storage
+    try {
+      const head = await this.storageService.headObject({ objectKey: session.r2Key });
+      if (head && head.contentLength === session.expectedSize) {
+        // Completed object exists! Leave session recoverable for completion reconciliation
+        await this.db
+          .update(uploadSessions)
+          .set({ status: "VERIFYING", updatedAt: new Date() })
+          .where(
+            and(eq(uploadSessions.id, sessionId), eq(uploadSessions.organizationId, organizationId))
+          );
+        return;
+      }
+    } catch {
+      // Head check error; proceed to abort attempt
     }
 
     // Best-effort abort in R2
@@ -1088,7 +1387,11 @@ export class UploadSessionService {
         updatedAt: new Date(),
       })
       .where(
-        and(eq(uploadSessions.id, sessionId), eq(uploadSessions.organizationId, organizationId))
+        and(
+          eq(uploadSessions.id, sessionId),
+          eq(uploadSessions.organizationId, organizationId),
+          inArray(uploadSessions.status, ["CREATED", "UPLOADING", "UPLOADED"])
+        )
       );
   }
 }

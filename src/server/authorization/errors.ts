@@ -70,3 +70,10 @@ export class ValidationError extends Error {
     this.name = "ValidationError";
   }
 }
+
+export class IntegrityError extends Error {
+  constructor(message: string = "Data integrity violation") {
+    super(message);
+    this.name = "IntegrityError";
+  }
+}

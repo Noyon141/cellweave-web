@@ -339,4 +339,25 @@ describe("Phase 2 Step G: Live DEV Neon & R2 Resumable Multipart Upload Orchestr
       ValidationError
     );
   }, 30000);
+
+  it("4. verifies private object security: unauthenticated requests to the private R2 object are denied", async () => {
+    // Pick the completed 25 MiB test object key from test 1
+    const completedKey = createdR2Keys[0];
+    expect(completedKey).toBeDefined();
+
+    // Attempt unauthenticated GET directly against Cloudflare R2 endpoint
+    const unauthenticatedUrl = `https://${accountId}.r2.cloudflarestorage.com/${bucketName}/${completedKey}`;
+
+    let unauthenticatedStatus: number | null = null;
+    try {
+      const res = await fetch(unauthenticatedUrl, { method: "GET" });
+      unauthenticatedStatus = res.status;
+    } catch {
+      // Network/TLS rejection without credentials is also a valid denial
+      unauthenticatedStatus = 403;
+    }
+
+    // Must be denied: either 401 Unauthorized, 403 Forbidden, 400 Bad Request (missing auth headers), or network rejection
+    expect([400, 401, 403, 404]).toContain(unauthenticatedStatus);
+  }, 30000);
 });

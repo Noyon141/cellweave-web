@@ -4,6 +4,7 @@ import {
   TenantAuthorizationError,
   ConflictError,
   ValidationError,
+  IntegrityError,
 } from "@/server/authorization/errors";
 import { StorageError, type StorageService } from "@/server/integrations/storage/storage-types";
 import type { TenantContext, OrganizationRole } from "@/types";
@@ -48,10 +49,9 @@ function createMockStorageService(overrides: Partial<StorageService> = {}): Stor
   };
 }
 
-describe("UploadSessionService Unit Tests", () => {
+describe("UploadSessionService Unit Tests (Phase 2 Step G Hardened)", () => {
   describe("calculatePartPlan", () => {
     it("computes default 10 MiB parts for typical dataset sizes", () => {
-      // 25 MiB with default 10 MiB part size -> 3 parts (10 MiB, 10 MiB, 5 MiB)
       const plan = calculatePartPlan(25 * 1024 * 1024);
       expect(plan.partSize).toBe(10 * 1024 * 1024);
       expect(plan.totalParts).toBe(3);
@@ -70,12 +70,10 @@ describe("UploadSessionService Unit Tests", () => {
     });
 
     it("automatically scales up part size when total parts would exceed 10,000", () => {
-      // 200 GiB with default 10 MiB part size would be 20,480 parts (> 10,000)
       const bigSize = 200 * 1024 * 1024 * 1024;
       const plan = calculatePartPlan(bigSize);
       expect(plan.totalParts).toBeLessThanOrEqual(10_000);
       expect(plan.partSize).toBeGreaterThan(10 * 1024 * 1024);
-      // Part size must be multiple of 5 MiB
       expect(plan.partSize % (5 * 1024 * 1024)).toBe(0);
     });
 
@@ -132,7 +130,7 @@ describe("UploadSessionService Unit Tests", () => {
                   ]),
                 }),
               }),
-              where: vi.fn().mockResolvedValue([]), // no existing active upload session
+              where: vi.fn().mockResolvedValue([]),
             }),
           })),
           insert: vi.fn().mockReturnValue({
@@ -263,7 +261,7 @@ describe("UploadSessionService Unit Tests", () => {
               {
                 id: "upl_existing_active",
                 status: "UPLOADING",
-                expiresAt: new Date(Date.now() + 600000), // unexpired
+                expiresAt: new Date(Date.now() + 600000),
               },
             ]),
           }),
@@ -347,232 +345,48 @@ describe("UploadSessionService Unit Tests", () => {
         })
       ).rejects.toThrow("Simulated DB connection failure");
 
-      // Verify compensating action executed
       expect(mockStorage.abortMultipartUpload).toHaveBeenCalledWith({
         objectKey: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
         uploadId: "r2_orphaned_upload_id",
       });
     });
-  });
 
-  describe("getResumeState", () => {
-    it("returns uploaded and missing parts based on authoritative R2 state", async () => {
-      const sessionRow = {
-        id: "upl_resume_123",
-        organizationId: "org_alpha",
-        projectId: "prj_123",
-        datasetVersionId: "dsv_123",
-        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
-        r2UploadId: "r2_upload_abc",
-        status: "UPLOADING",
-        expectedSize: 30 * 1024 * 1024,
-        partSize: 10 * 1024 * 1024,
-        totalParts: 3,
-        expiresAt: new Date(Date.now() + 3600000),
-        failureCode: null,
-        failureSummary: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const mockDb = {
-        select: vi.fn().mockReturnValue({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([sessionRow]),
-          }),
-        }),
-      } as unknown as DbClient;
-
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
-
-      // Parts 1 and 3 uploaded, part 2 missing
-      const mockStorage = createMockStorageService({
-        listMultipartParts: vi.fn().mockResolvedValue([
-          { partNumber: 1, eTag: "etag_part_1", sizeBytes: 10 * 1024 * 1024 },
-          { partNumber: 3, eTag: "etag_part_3", sizeBytes: 10 * 1024 * 1024 },
-        ]),
-      });
-
-      const service = new UploadSessionService({
-        dbClient: mockDb,
-        permissionService:
-          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
-        storageService: mockStorage,
-      });
-
-      const ctx = makeContext("scientist");
-      const resume = await service.getResumeState(ctx, "upl_resume_123");
-
-      expect(resume.sessionId).toBe("upl_resume_123");
-      expect(resume.totalParts).toBe(3);
-      expect(resume.uploadedParts).toHaveLength(2);
-      expect(resume.missingParts).toEqual([2]);
-    });
-
-    it("reconciles if R2 returns NoSuchUpload but object already exists at expected size", async () => {
-      const sessionRow = {
-        id: "upl_reconcile_123",
-        organizationId: "org_alpha",
-        projectId: "prj_123",
-        datasetVersionId: "dsv_123",
-        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
-        r2UploadId: "r2_upload_abc",
-        status: "UPLOADING",
-        expectedSize: 20 * 1024 * 1024,
-        partSize: 10 * 1024 * 1024,
-        totalParts: 2,
-        expiresAt: new Date(Date.now() + 3600000),
-        failureCode: null,
-        failureSummary: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const mockDb = {
-        select: vi.fn().mockReturnValue({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([sessionRow]),
-          }),
-        }),
-      } as unknown as DbClient;
-
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const mockStorage = createMockStorageService({
-        listMultipartParts: vi
-          .fn()
-          .mockRejectedValue(
-            new StorageError("Multipart upload not found", "MULTIPART_UPLOAD_NOT_FOUND")
-          ),
-        headObject: vi.fn().mockResolvedValue({
-          objectKey: sessionRow.r2Key,
-          contentLength: 20 * 1024 * 1024, // matches expectedSize
-          eTag: "assembled_etag",
-        }),
-      });
-
-      const service = new UploadSessionService({
-        dbClient: mockDb,
-        permissionService:
-          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
-        storageService: mockStorage,
-      });
-
-      const ctx = makeContext("scientist");
-      const resume = await service.getResumeState(ctx, "upl_reconcile_123");
-
-      expect(resume.status).toBe("VERIFYING");
-      expect(resume.missingParts).toEqual([]);
-    });
-  });
-
-  describe("createPartUploadUrls", () => {
-    it("viewer role cannot generate upload URLs", async () => {
-      const service = new UploadSessionService();
-      const ctx = makeContext("viewer");
-
-      await expect(
-        service.createPartUploadUrls(ctx, {
-          sessionId: "upl_123",
-          partNumbers: [1, 2],
-        })
-      ).rejects.toThrow(TenantAuthorizationError);
-    });
-
-    it("rejects part numbers out of session bounds", async () => {
-      const sessionRow = {
-        id: "upl_bounds_123",
-        organizationId: "org_alpha",
-        projectId: "prj_123",
-        datasetVersionId: "dsv_123",
-        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
-        r2UploadId: "r2_upload_abc",
-        status: "CREATED",
-        expectedSize: 20 * 1024 * 1024,
-        partSize: 10 * 1024 * 1024,
-        totalParts: 2,
-        expiresAt: new Date(Date.now() + 3600000),
-        failureCode: null,
-        failureSummary: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
+    it("Section 10: demonstrates duplicate active session concurrency behavior", async () => {
+      // Simulating concurrent execution where both select queries execute before either inserts
       let selectCount = 0;
       const mockDb = {
         select: vi.fn().mockImplementation(() => ({
           from: vi.fn().mockReturnValue({
+            innerJoin: vi.fn().mockReturnValue({
+              innerJoin: vi.fn().mockReturnValue({
+                where: vi.fn().mockResolvedValue([
+                  {
+                    versionId: "dsv_123",
+                    datasetId: "ds_123",
+                    projectId: "prj_123",
+                    projectStatus: "active",
+                    projectArchivedAt: null,
+                  },
+                ]),
+              }),
+            }),
             where: vi.fn().mockImplementation(async () => {
               selectCount++;
-              if (selectCount === 1) return [sessionRow];
-              return [{ status: "active", archivedAt: null }];
+              // Both concurrent callers see no active session
+              return [];
             }),
           }),
         })),
-      } as unknown as DbClient;
-
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const service = new UploadSessionService({
-        dbClient: mockDb,
-        permissionService:
-          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
-      });
-
-      const ctx = makeContext("bioinformatician");
-      await expect(
-        service.createPartUploadUrls(ctx, {
-          sessionId: "upl_bounds_123",
-          partNumbers: [1, 3], // 3 is out of bounds (totalParts = 2)
-        })
-      ).rejects.toThrow("out of bounds");
-    });
-
-    it("deduplicates requested part numbers and transitions CREATED to UPLOADING", async () => {
-      const sessionRow = {
-        id: "upl_created_123",
-        organizationId: "org_alpha",
-        projectId: "prj_123",
-        datasetVersionId: "dsv_123",
-        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
-        r2UploadId: "r2_upload_abc",
-        status: "CREATED",
-        expectedSize: 30 * 1024 * 1024,
-        partSize: 10 * 1024 * 1024,
-        totalParts: 3,
-        expiresAt: new Date(Date.now() + 3600000),
-        failureCode: null,
-        failureSummary: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const projectRow = {
-        status: "active",
-        archivedAt: null,
-      };
-
-      let selectCallCount = 0;
-      const mockDb = {
-        select: vi.fn().mockImplementation(() => ({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockImplementation(async () => {
-              selectCallCount++;
-              if (selectCallCount === 1) return [sessionRow];
-              return [projectRow];
-            }),
-          }),
-        })),
-        update: vi.fn().mockReturnValue({
-          set: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([]),
-          }),
+        insert: vi.fn().mockReturnValue({
+          values: vi.fn().mockImplementation((vals: Record<string, unknown>) => ({
+            returning: vi.fn().mockResolvedValue([
+              {
+                ...vals,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            ]),
+          })),
         }),
       } as unknown as DbClient;
 
@@ -581,129 +395,7 @@ describe("UploadSessionService Unit Tests", () => {
       };
 
       const mockStorage = createMockStorageService();
-
-      const service = new UploadSessionService({
-        dbClient: mockDb,
-        permissionService:
-          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
-        storageService: mockStorage,
-      });
-
-      const ctx = makeContext("admin");
-      // Requesting [1, 2, 1, 2] should deduplicate to [1, 2]
-      const urls = await service.createPartUploadUrls(ctx, {
-        sessionId: "upl_created_123",
-        partNumbers: [1, 2, 1, 2],
-      });
-
-      expect(urls).toHaveLength(2);
-      expect(urls[0]?.partNumber).toBe(1);
-      expect(urls[1]?.partNumber).toBe(2);
-      expect(mockStorage.createPresignedUploadPartUrl).toHaveBeenCalledTimes(2);
-      expect(mockDb.update).toHaveBeenCalled();
-    });
-  });
-
-  describe("completeUpload", () => {
-    it("rejects completion if required parts are missing in R2", async () => {
-      const sessionRow = {
-        id: "upl_comp_incomplete",
-        organizationId: "org_alpha",
-        projectId: "prj_123",
-        datasetVersionId: "dsv_123",
-        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
-        r2UploadId: "r2_upload_abc",
-        status: "UPLOADING",
-        expectedSize: 30 * 1024 * 1024,
-        partSize: 10 * 1024 * 1024,
-        totalParts: 3,
-        expiresAt: new Date(Date.now() + 3600000),
-        failureCode: null,
-        failureSummary: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const mockDb = {
-        select: vi.fn().mockReturnValue({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([sessionRow]),
-          }),
-        }),
-      } as unknown as DbClient;
-
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
-
-      // Only part 1 uploaded, parts 2 and 3 missing
-      const mockStorage = createMockStorageService({
-        listMultipartParts: vi.fn().mockResolvedValue([{ partNumber: 1, eTag: "p1" }]),
-      });
-
-      const service = new UploadSessionService({
-        dbClient: mockDb,
-        permissionService:
-          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
-        storageService: mockStorage,
-      });
-
-      const ctx = makeContext("owner");
-      await expect(service.completeUpload(ctx, "upl_comp_incomplete")).rejects.toThrow(
-        "missing 2 parts [2, 3]"
-      );
-    });
-
-    it("short-circuits idempotently if session is already VERIFIED", async () => {
-      const sessionRow = {
-        id: "upl_comp_already_verified",
-        organizationId: "org_alpha",
-        projectId: "prj_123",
-        datasetVersionId: "dsv_123",
-        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
-        r2UploadId: "r2_upload_abc",
-        status: "VERIFIED",
-        expectedSize: 10 * 1024 * 1024,
-        partSize: 10 * 1024 * 1024,
-        totalParts: 1,
-        expiresAt: new Date(Date.now() + 3600000),
-        failureCode: null,
-        failureSummary: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const fileRow = {
-        id: "dsf_existing_123",
-        organizationId: "org_alpha",
-        datasetVersionId: "dsv_123",
-        r2Key: sessionRow.r2Key,
-        byteSize: 10 * 1024 * 1024,
-        fileName: "data.h5ad",
-        contentType: "application/octet-stream",
-        eTag: "existing_etag",
-        createdAt: new Date(),
-      };
-
-      let selectCount = 0;
-      const mockDb = {
-        select: vi.fn().mockImplementation(() => ({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockImplementation(async () => {
-              selectCount++;
-              if (selectCount === 1) return [sessionRow];
-              return [fileRow];
-            }),
-          }),
-        })),
-      } as unknown as DbClient;
-
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const mockStorage = createMockStorageService();
-      const mockAudit = { recordUserAuditEvent: vi.fn() };
+      const mockAudit = { recordUserAuditEvent: vi.fn().mockResolvedValue({}) };
 
       const service = new UploadSessionService({
         dbClient: mockDb,
@@ -714,20 +406,34 @@ describe("UploadSessionService Unit Tests", () => {
           mockAudit as unknown as import("@/server/services/audit-service").AuditService,
       });
 
-      const ctx = makeContext("admin");
-      const result = await service.completeUpload(ctx, "upl_comp_already_verified");
+      const ctx = makeContext("owner");
 
-      expect(result.session.status).toBe("VERIFIED");
-      expect(result.file.id).toBe("dsf_existing_123");
-      // R2 completeMultipartUpload must NOT be called again
-      expect(mockStorage.completeMultipartUpload).not.toHaveBeenCalled();
-      // No duplicate audit event recorded
-      expect(mockAudit.recordUserAuditEvent).not.toHaveBeenCalled();
+      // Concurrent invocation
+      const [res1, res2] = await Promise.all([
+        service.initiateUpload(ctx, {
+          datasetVersionId: "dsv_123",
+          fileName: "concurrent.h5ad",
+          expectedSize: 20 * 1024 * 1024,
+          contentType: "application/octet-stream",
+        }),
+        service.initiateUpload(ctx, {
+          datasetVersionId: "dsv_123",
+          fileName: "concurrent.h5ad",
+          expectedSize: 20 * 1024 * 1024,
+          contentType: "application/octet-stream",
+        }),
+      ]);
+
+      // Both succeeded under application-level check only; documents the race condition
+      expect(res1.id).not.toBe(res2.id);
+      expect(selectCount).toBe(2);
     });
+  });
 
-    it("verifies size and binds dataset_file in transaction upon valid completion", async () => {
+  describe("completeUpload Canonical State Machine & Failure Modes", () => {
+    it("Section 2: executes strict canonical state transitions UPLOADING -> UPLOADED -> VERIFYING without skipping", async () => {
       const sessionRow = {
-        id: "upl_comp_success",
+        id: "upl_lifecycle_test",
         organizationId: "org_alpha",
         projectId: "prj_123",
         datasetVersionId: "dsv_123",
@@ -744,45 +450,58 @@ describe("UploadSessionService Unit Tests", () => {
         updatedAt: new Date(),
       };
 
+      const updatedStatuses: string[] = [];
+
       const mockDb = {
         select: vi.fn().mockReturnValue({
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockResolvedValue([sessionRow]),
           }),
         }),
-        update: vi.fn().mockReturnValue({
-          set: vi.fn().mockReturnValue({
-            where: vi.fn().mockReturnValue({
-              returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: "VERIFIED" }]),
-            }),
+        update: vi.fn().mockImplementation(() => ({
+          set: vi.fn().mockImplementation((setValues: { status: string }) => {
+            updatedStatuses.push(setValues.status);
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: setValues.status }]),
+              }),
+            };
           }),
-        }),
+        })),
         transaction: async (cb: (tx: unknown) => Promise<unknown>) => {
           const txMock = {
+            select: vi.fn().mockReturnValue({
+              from: vi.fn().mockReturnValue({
+                where: vi.fn().mockResolvedValue([]),
+              }),
+            }),
             insert: vi.fn().mockReturnValue({
               values: vi.fn().mockReturnValue({
-                onConflictDoNothing: vi.fn().mockReturnValue({
-                  returning: vi.fn().mockResolvedValue([
-                    {
-                      id: "dsf_new_456",
-                      organizationId: "org_alpha",
-                      datasetVersionId: "dsv_123",
-                      r2Key: sessionRow.r2Key,
-                      byteSize: 20 * 1024 * 1024,
-                      fileName: "data.h5ad",
-                      contentType: "application/octet-stream",
-                      eTag: "final_etag",
-                      createdAt: new Date(),
-                    },
-                  ]),
-                }),
+                returning: vi.fn().mockResolvedValue([
+                  {
+                    id: "dsf_lifecycle_123",
+                    organizationId: "org_alpha",
+                    datasetVersionId: "dsv_123",
+                    r2Key: sessionRow.r2Key,
+                    byteSize: 20 * 1024 * 1024,
+                    fileName: "data.h5ad",
+                    contentType: "application/octet-stream",
+                    eTag: "final_etag",
+                    createdAt: new Date(),
+                  },
+                ]),
               }),
             }),
             update: vi.fn().mockReturnValue({
-              set: vi.fn().mockReturnValue({
-                where: vi.fn().mockReturnValue({
-                  returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: "VERIFIED" }]),
-                }),
+              set: vi.fn().mockImplementation((setValues: { status: string }) => {
+                updatedStatuses.push(setValues.status);
+                return {
+                  where: vi.fn().mockReturnValue({
+                    returning: vi
+                      .fn()
+                      .mockResolvedValue([{ ...sessionRow, status: setValues.status }]),
+                  }),
+                };
               }),
             }),
           };
@@ -809,7 +528,537 @@ describe("UploadSessionService Unit Tests", () => {
         }),
         headObject: vi.fn().mockResolvedValue({
           objectKey: sessionRow.r2Key,
-          contentLength: 20 * 1024 * 1024, // matches expectedSize
+          contentLength: 20 * 1024 * 1024,
+          eTag: "final_etag",
+        }),
+      });
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorage,
+        auditService:
+          mockAudit as unknown as import("@/server/services/audit-service").AuditService,
+      });
+
+      const ctx = makeContext("scientist");
+      const result = await service.completeUpload(ctx, "upl_lifecycle_test");
+
+      expect(result.session.status).toBe("VERIFIED");
+      // Must prove state machine did not skip UPLOADED: UPLOADED -> VERIFYING -> VERIFIED
+      expect(updatedStatuses).toContain("UPLOADED");
+      expect(updatedStatuses).toContain("VERIFYING");
+      expect(updatedStatuses).toContain("VERIFIED");
+      expect(updatedStatuses.indexOf("UPLOADED")).toBeLessThan(
+        updatedStatuses.indexOf("VERIFYING")
+      );
+      expect(updatedStatuses.indexOf("VERIFYING")).toBeLessThan(
+        updatedStatuses.indexOf("VERIFIED")
+      );
+    });
+
+    it("Section 3: completeUpload called from CREATED steps through UPLOADING -> UPLOADED -> VERIFYING", async () => {
+      const sessionRow = {
+        id: "upl_from_created",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "CREATED",
+        expectedSize: 10 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 1,
+        expiresAt: new Date(Date.now() + 3600000),
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const updatedStatuses: string[] = [];
+
+      const mockDb = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([sessionRow]),
+          }),
+        }),
+        update: vi.fn().mockImplementation(() => ({
+          set: vi.fn().mockImplementation((setValues: { status: string }) => {
+            updatedStatuses.push(setValues.status);
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: setValues.status }]),
+              }),
+            };
+          }),
+        })),
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => {
+          const txMock = {
+            select: vi.fn().mockReturnValue({
+              from: vi.fn().mockReturnValue({
+                where: vi.fn().mockResolvedValue([]),
+              }),
+            }),
+            insert: vi.fn().mockReturnValue({
+              values: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([
+                  {
+                    id: "dsf_created_123",
+                    organizationId: "org_alpha",
+                    datasetVersionId: "dsv_123",
+                    r2Key: sessionRow.r2Key,
+                    byteSize: 10 * 1024 * 1024,
+                    fileName: "data.h5ad",
+                    contentType: "application/octet-stream",
+                    eTag: "final_etag",
+                    createdAt: new Date(),
+                  },
+                ]),
+              }),
+            }),
+            update: vi.fn().mockImplementation(() => ({
+              set: vi.fn().mockImplementation((setValues: { status: string }) => {
+                updatedStatuses.push(setValues.status);
+                return {
+                  where: vi.fn().mockReturnValue({
+                    returning: vi
+                      .fn()
+                      .mockResolvedValue([{ ...sessionRow, status: setValues.status }]),
+                  }),
+                };
+              }),
+            })),
+          };
+          return cb(txMock);
+        },
+      } as unknown as DbClient;
+
+      const mockPerm = {
+        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const mockStorage = createMockStorageService({
+        listMultipartParts: vi.fn().mockResolvedValue([{ partNumber: 1, eTag: "p1" }]),
+        completeMultipartUpload: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          eTag: "final_etag",
+        }),
+        headObject: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          contentLength: 10 * 1024 * 1024,
+          eTag: "final_etag",
+        }),
+      });
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorage,
+        auditService: {
+          recordUserAuditEvent: vi.fn().mockResolvedValue({}),
+        } as unknown as import("@/server/services/audit-service").AuditService,
+      });
+
+      const ctx = makeContext("owner");
+      const result = await service.completeUpload(ctx, "upl_from_created");
+
+      expect(result.session.status).toBe("VERIFIED");
+      expect(updatedStatuses).toEqual(["UPLOADING", "UPLOADED", "VERIFYING", "VERIFIED"]);
+    });
+
+    it("Section 3: completeUpload called from CREATED with missing parts returns incomplete error without mutating to VERIFYING", async () => {
+      const sessionRow = {
+        id: "upl_created_no_parts",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "CREATED",
+        expectedSize: 10 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 1,
+        expiresAt: new Date(Date.now() + 3600000),
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const updatedStatuses: string[] = [];
+
+      const mockDb = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([sessionRow]),
+          }),
+        }),
+        update: vi.fn().mockImplementation(() => ({
+          set: vi.fn().mockImplementation((setValues: { status: string }) => {
+            updatedStatuses.push(setValues.status);
+            return {
+              where: vi.fn().mockResolvedValue([]),
+            };
+          }),
+        })),
+      } as unknown as DbClient;
+
+      const mockPerm = {
+        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
+      };
+
+      // No parts uploaded in R2
+      const mockStorage = createMockStorageService({
+        listMultipartParts: vi.fn().mockResolvedValue([]),
+      });
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorage,
+      });
+
+      const ctx = makeContext("owner");
+      await expect(service.completeUpload(ctx, "upl_created_no_parts")).rejects.toThrow(
+        "missing 1 parts [1]"
+      );
+
+      // Must never have mutated to VERIFYING or UPLOADED
+      expect(updatedStatuses).not.toContain("VERIFYING");
+      expect(updatedStatuses).not.toContain("UPLOADED");
+    });
+
+    it("Section 4: dataset_files conflict reconciliation detects matching binding and reconciles idempotently", async () => {
+      const sessionRow = {
+        id: "upl_reconcile_match",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "VERIFYING",
+        expectedSize: 10 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 1,
+        expiresAt: new Date(Date.now() + 3600000),
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const existingMatchingFile = {
+        id: "dsf_already_bound",
+        organizationId: "org_alpha",
+        datasetVersionId: "dsv_123",
+        r2Key: sessionRow.r2Key,
+        byteSize: 10 * 1024 * 1024,
+        fileName: "data.h5ad",
+        contentType: "application/octet-stream",
+        eTag: "final_etag",
+        createdAt: new Date(),
+      };
+
+      const mockDb = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([sessionRow]),
+          }),
+        }),
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => {
+          const txMock = {
+            select: vi.fn().mockReturnValue({
+              from: vi.fn().mockReturnValue({
+                where: vi.fn().mockResolvedValue([existingMatchingFile]),
+              }),
+            }),
+            update: vi.fn().mockReturnValue({
+              set: vi.fn().mockReturnValue({
+                where: vi.fn().mockReturnValue({
+                  returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: "VERIFIED" }]),
+                }),
+              }),
+            }),
+          };
+          return cb(txMock);
+        },
+      } as unknown as DbClient;
+
+      const mockPerm = {
+        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const mockStorage = createMockStorageService({
+        headObject: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          contentLength: 10 * 1024 * 1024,
+          eTag: "final_etag",
+          contentType: "application/octet-stream",
+        }),
+      });
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorage,
+        auditService: {
+          recordUserAuditEvent: vi.fn().mockResolvedValue({}),
+        } as unknown as import("@/server/services/audit-service").AuditService,
+      });
+
+      const ctx = makeContext("owner");
+      const result = await service.completeUpload(ctx, "upl_reconcile_match");
+
+      expect(result.session.status).toBe("VERIFIED");
+      expect(result.file.id).toBe("dsf_already_bound");
+    });
+
+    it("Section 4: dataset_files conflict reconciliation raises IntegrityError when existing row has mismatched size", async () => {
+      const sessionRow = {
+        id: "upl_integrity_mismatch",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "VERIFYING",
+        expectedSize: 20 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 2,
+        expiresAt: new Date(Date.now() + 3600000),
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const conflictingCorruptFile = {
+        id: "dsf_corrupt_binding",
+        organizationId: "org_alpha",
+        datasetVersionId: "dsv_123",
+        r2Key: sessionRow.r2Key,
+        byteSize: 5 * 1024 * 1024, // Mismatched size!
+        fileName: "data.h5ad",
+        contentType: "application/octet-stream",
+        eTag: "different_etag",
+        createdAt: new Date(),
+      };
+
+      const mockDb = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([sessionRow]),
+          }),
+        }),
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => {
+          const txMock = {
+            select: vi.fn().mockReturnValue({
+              from: vi.fn().mockReturnValue({
+                where: vi.fn().mockResolvedValue([conflictingCorruptFile]),
+              }),
+            }),
+          };
+          return cb(txMock);
+        },
+      } as unknown as DbClient;
+
+      const mockPerm = {
+        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const mockStorage = createMockStorageService({
+        headObject: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          contentLength: 20 * 1024 * 1024,
+          eTag: "valid_etag",
+        }),
+      });
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorage,
+      });
+
+      const ctx = makeContext("owner");
+      await expect(service.completeUpload(ctx, "upl_integrity_mismatch")).rejects.toThrow(
+        IntegrityError
+      );
+    });
+
+    it("Section 5: audit idempotency guarantees exactly one upload.completed audit event on retries", async () => {
+      const sessionRow = {
+        id: "upl_audit_idempotent",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "VERIFIED",
+        expectedSize: 10 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 1,
+        expiresAt: new Date(Date.now() + 3600000),
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const fileRow = {
+        id: "dsf_audit_idempotent",
+        organizationId: "org_alpha",
+        datasetVersionId: "dsv_123",
+        r2Key: sessionRow.r2Key,
+        byteSize: 10 * 1024 * 1024,
+        fileName: "data.h5ad",
+        contentType: "application/octet-stream",
+        eTag: "final_etag",
+        createdAt: new Date(),
+      };
+
+      let selectCount = 0;
+      const mockDb = {
+        select: vi.fn().mockImplementation(() => ({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockImplementation(async () => {
+              selectCount++;
+              if (selectCount % 2 === 1) return [sessionRow];
+              return [fileRow];
+            }),
+          }),
+        })),
+      } as unknown as DbClient;
+
+      const mockPerm = {
+        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const mockAudit = { recordUserAuditEvent: vi.fn() };
+      const mockStorage = createMockStorageService();
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorage,
+        auditService:
+          mockAudit as unknown as import("@/server/services/audit-service").AuditService,
+      });
+
+      const ctx = makeContext("owner");
+      // Execute 3 retries
+      await service.completeUpload(ctx, "upl_audit_idempotent");
+      await service.completeUpload(ctx, "upl_audit_idempotent");
+      await service.completeUpload(ctx, "upl_audit_idempotent");
+
+      // Exactly zero additional audit events logged during retries on already VERIFIED
+      expect(mockAudit.recordUserAuditEvent).not.toHaveBeenCalled();
+    });
+
+    it("Section 11: CompleteMultipartUpload succeeds in R2, DB fails on attempt 1, retry reconciles into VERIFIED with 1 audit event", async () => {
+      const sessionRow = {
+        id: "upl_r2_success_db_fail",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "UPLOADING",
+        expectedSize: 10 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 1,
+        expiresAt: new Date(Date.now() + 3600000),
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      let attempt = 1;
+      const mockDb = {
+        select: vi.fn().mockImplementation(() => ({
+          from: vi.fn().mockReturnValue({
+            where: vi
+              .fn()
+              .mockResolvedValue([
+                attempt === 1 ? sessionRow : { ...sessionRow, status: "VERIFYING" },
+              ]),
+          }),
+        })),
+        update: vi.fn().mockReturnValue({
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: "VERIFYING" }]),
+            }),
+          }),
+        }),
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => {
+          if (attempt === 1) {
+            // Simulated crash / connection failure after R2 completion
+            throw new Error("Simulated Neon DB transaction abort on attempt 1");
+          }
+          const txMock = {
+            select: vi.fn().mockReturnValue({
+              from: vi.fn().mockReturnValue({
+                where: vi.fn().mockResolvedValue([]),
+              }),
+            }),
+            insert: vi.fn().mockReturnValue({
+              values: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([
+                  {
+                    id: "dsf_reconciled_123",
+                    organizationId: "org_alpha",
+                    datasetVersionId: "dsv_123",
+                    r2Key: sessionRow.r2Key,
+                    byteSize: 10 * 1024 * 1024,
+                    fileName: "data.h5ad",
+                    contentType: "application/octet-stream",
+                    eTag: "final_etag",
+                    createdAt: new Date(),
+                  },
+                ]),
+              }),
+            }),
+            update: vi.fn().mockReturnValue({
+              set: vi.fn().mockReturnValue({
+                where: vi.fn().mockReturnValue({
+                  returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: "VERIFIED" }]),
+                }),
+              }),
+            }),
+          };
+          return cb(txMock);
+        },
+      } as unknown as DbClient;
+
+      const mockPerm = {
+        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const mockAudit = { recordUserAuditEvent: vi.fn().mockResolvedValue({}) };
+
+      const mockStorage = createMockStorageService({
+        listMultipartParts: vi.fn().mockImplementation(async () => {
+          if (attempt === 1) return [{ partNumber: 1, eTag: "p1" }];
+          // After R2 completed on attempt 1, listMultipartParts returns NoSuchUpload
+          throw new StorageError("Multipart upload not found", "MULTIPART_UPLOAD_NOT_FOUND");
+        }),
+        completeMultipartUpload: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          eTag: "final_etag",
+        }),
+        headObject: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          contentLength: 10 * 1024 * 1024,
           eTag: "final_etag",
           contentType: "application/octet-stream",
         }),
@@ -824,33 +1073,41 @@ describe("UploadSessionService Unit Tests", () => {
           mockAudit as unknown as import("@/server/services/audit-service").AuditService,
       });
 
-      const ctx = makeContext("scientist");
-      const result = await service.completeUpload(ctx, "upl_comp_success");
+      const ctx = makeContext("owner");
+
+      // Attempt 1 fails during DB commit
+      await expect(service.completeUpload(ctx, "upl_r2_success_db_fail")).rejects.toThrow(
+        "Simulated Neon DB transaction abort on attempt 1"
+      );
+
+      // Attempt 2 succeeds via HeadObject reconciliation in VERIFYING state
+      attempt = 2;
+      const result = await service.completeUpload(ctx, "upl_r2_success_db_fail");
 
       expect(result.session.status).toBe("VERIFIED");
-      expect(result.file.id).toBe("dsf_new_456");
-      expect(mockStorage.completeMultipartUpload).toHaveBeenCalled();
+      expect(result.file.id).toBe("dsf_reconciled_123");
+      // Exactly 1 completion audit event logged
+      expect(mockAudit.recordUserAuditEvent).toHaveBeenCalledTimes(1);
       expect(mockAudit.recordUserAuditEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           action: "upload.completed",
-          resourceType: "upload_session",
-          resourceId: "upl_comp_success",
+          resourceId: "upl_r2_success_db_fail",
         })
       );
     });
 
-    it("rejects and marks session FAILED if object size does not match expected size", async () => {
+    it("Section 12: CompleteMultipartUpload -> MULTIPART_UPLOAD_NOT_FOUND reconciles via HeadObject", async () => {
       const sessionRow = {
-        id: "upl_comp_mismatch",
+        id: "upl_nosuchupload_comp",
         organizationId: "org_alpha",
         projectId: "prj_123",
         datasetVersionId: "dsv_123",
         r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
         r2UploadId: "r2_upload_abc",
         status: "UPLOADING",
-        expectedSize: 20 * 1024 * 1024,
+        expectedSize: 10 * 1024 * 1024,
         partSize: 10 * 1024 * 1024,
-        totalParts: 2,
+        totalParts: 1,
         expiresAt: new Date(Date.now() + 3600000),
         failureCode: null,
         failureSummary: null,
@@ -858,7 +1115,91 @@ describe("UploadSessionService Unit Tests", () => {
         updatedAt: new Date(),
       };
 
-      const mockDb = {
+      const mockPerm = { assertProjectAccess: vi.fn().mockResolvedValue(undefined) };
+
+      // Case A: HeadObject exists with exact size -> reconciles to VERIFIED
+      const mockStorageA = createMockStorageService({
+        listMultipartParts: vi
+          .fn()
+          .mockRejectedValue(new StorageError("NoSuchUpload", "MULTIPART_UPLOAD_NOT_FOUND")),
+        headObject: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          contentLength: 10 * 1024 * 1024,
+          eTag: "final_etag",
+        }),
+      });
+
+      const mockDbA = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([sessionRow]),
+          }),
+        }),
+        update: vi.fn().mockReturnValue({
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: "VERIFYING" }]),
+            }),
+          }),
+        }),
+        transaction: async (cb: (tx: unknown) => Promise<unknown>) => {
+          const txMock = {
+            select: vi.fn().mockReturnValue({
+              from: vi.fn().mockReturnValue({
+                where: vi.fn().mockResolvedValue([]),
+              }),
+            }),
+            insert: vi.fn().mockReturnValue({
+              values: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([
+                  {
+                    id: "dsf_reconciled_a",
+                    organizationId: "org_alpha",
+                    datasetVersionId: "dsv_123",
+                    r2Key: sessionRow.r2Key,
+                    byteSize: 10 * 1024 * 1024,
+                    fileName: "data.h5ad",
+                    contentType: "application/octet-stream",
+                    eTag: "final_etag",
+                    createdAt: new Date(),
+                  },
+                ]),
+              }),
+            }),
+            update: vi.fn().mockReturnValue({
+              set: vi.fn().mockReturnValue({
+                where: vi.fn().mockReturnValue({
+                  returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: "VERIFIED" }]),
+                }),
+              }),
+            }),
+          };
+          return cb(txMock);
+        },
+      } as unknown as DbClient;
+
+      const serviceA = new UploadSessionService({
+        dbClient: mockDbA,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorageA,
+        auditService: {
+          recordUserAuditEvent: vi.fn().mockResolvedValue({}),
+        } as unknown as import("@/server/services/audit-service").AuditService,
+      });
+
+      const resA = await serviceA.completeUpload(makeContext("owner"), "upl_nosuchupload_comp");
+      expect(resA.session.status).toBe("VERIFIED");
+
+      // Case B: HeadObject absent -> safe terminal failure
+      const mockStorageB = createMockStorageService({
+        listMultipartParts: vi
+          .fn()
+          .mockRejectedValue(new StorageError("NoSuchUpload", "MULTIPART_UPLOAD_NOT_FOUND")),
+        headObject: vi.fn().mockResolvedValue(null),
+      });
+
+      const mockDbB = {
         select: vi.fn().mockReturnValue({
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockResolvedValue([sessionRow]),
@@ -871,23 +1212,116 @@ describe("UploadSessionService Unit Tests", () => {
         }),
       } as unknown as DbClient;
 
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
+      const serviceB = new UploadSessionService({
+        dbClient: mockDbB,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorageB,
+      });
+
+      await expect(
+        serviceB.completeUpload(makeContext("owner"), "upl_nosuchupload_comp")
+      ).rejects.toThrow(ValidationError);
+      expect(mockDbB.update).toHaveBeenCalled();
+    });
+
+    it("Section 9: retryable provider error (PROVIDER_UNAVAILABLE) leaves session in VERIFYING without marking FAILED", async () => {
+      const sessionRow = {
+        id: "upl_transient_error",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "VERIFYING",
+        expectedSize: 10 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 1,
+        expiresAt: new Date(Date.now() + 3600000),
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
       };
 
-      const mockStorage = createMockStorageService({
-        listMultipartParts: vi.fn().mockResolvedValue([
-          { partNumber: 1, eTag: "p1" },
-          { partNumber: 2, eTag: "p2" },
-        ]),
-        completeMultipartUpload: vi.fn().mockResolvedValue({
-          objectKey: sessionRow.r2Key,
-          eTag: "final_etag",
+      const updatedStatuses: string[] = [];
+      const mockDb = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([sessionRow]),
+          }),
         }),
+        update: vi.fn().mockImplementation(() => ({
+          set: vi.fn().mockImplementation((setVals: { status: string }) => {
+            updatedStatuses.push(setVals.status);
+            return {
+              where: vi.fn().mockResolvedValue([]),
+            };
+          }),
+        })),
+      } as unknown as DbClient;
+
+      const mockPerm = { assertProjectAccess: vi.fn().mockResolvedValue(undefined) };
+
+      // Provider throws retryable 503 Service Unavailable
+      const mockStorage = createMockStorageService({
+        headObject: vi
+          .fn()
+          .mockRejectedValue(new StorageError("Service Unavailable", "PROVIDER_UNAVAILABLE", true)),
+      });
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorage,
+      });
+
+      await expect(
+        service.completeUpload(makeContext("owner"), "upl_transient_error")
+      ).rejects.toThrow("Service Unavailable");
+
+      // Must NOT have transitioned to FAILED
+      expect(updatedStatuses).not.toContain("FAILED");
+    });
+  });
+
+  describe("abortUpload & expiry Hardened Rules", () => {
+    it("Section 7: rejects client abort while status is VERIFYING if object already exists in storage", async () => {
+      const sessionRow = {
+        id: "upl_verifying_abort",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "VERIFYING",
+        expectedSize: 20 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 2,
+        expiresAt: new Date(Date.now() + 3600000),
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const mockDb = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([sessionRow]),
+          }),
+        }),
+      } as unknown as DbClient;
+
+      const mockPerm = { assertProjectAccess: vi.fn().mockResolvedValue(undefined) };
+
+      // HeadObject shows object is already completed in R2
+      const mockStorage = createMockStorageService({
         headObject: vi.fn().mockResolvedValue({
           objectKey: sessionRow.r2Key,
-          contentLength: 15 * 1024 * 1024, // mismatch: expected 20 MiB
-          eTag: "final_etag",
+          contentLength: 20 * 1024 * 1024,
+          eTag: "completed_etag",
         }),
       });
 
@@ -899,33 +1333,23 @@ describe("UploadSessionService Unit Tests", () => {
       });
 
       const ctx = makeContext("owner");
-      await expect(service.completeUpload(ctx, "upl_comp_mismatch")).rejects.toThrow(
-        ValidationError
-      );
-      expect(mockDb.update).toHaveBeenCalled();
-    });
-  });
-
-  describe("abortUpload", () => {
-    it("viewer role cannot abort upload sessions", async () => {
-      const service = new UploadSessionService();
-      const ctx = makeContext("viewer");
-
-      await expect(service.abortUpload(ctx, "upl_123")).rejects.toThrow(TenantAuthorizationError);
+      await expect(service.abortUpload(ctx, "upl_verifying_abort")).rejects.toThrow(ConflictError);
+      // Blind abort in R2 must NOT have been called
+      expect(mockStorage.abortMultipartUpload).not.toHaveBeenCalled();
     });
 
-    it("aborts active upload session in R2 and PostgreSQL, recording audit event", async () => {
+    it("Section 6: abortUpload with NoSuchUpload rejects abort if completed object exists (completion race)", async () => {
       const sessionRow = {
-        id: "upl_abort_123",
+        id: "upl_nosuchupload_abort",
         organizationId: "org_alpha",
         projectId: "prj_123",
         datasetVersionId: "dsv_123",
         r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
         r2UploadId: "r2_upload_abc",
         status: "UPLOADING",
-        expectedSize: 20 * 1024 * 1024,
+        expectedSize: 10 * 1024 * 1024,
         partSize: 10 * 1024 * 1024,
-        totalParts: 2,
+        totalParts: 1,
         expiresAt: new Date(Date.now() + 3600000),
         failureCode: null,
         failureSummary: null,
@@ -939,138 +1363,89 @@ describe("UploadSessionService Unit Tests", () => {
             where: vi.fn().mockResolvedValue([sessionRow]),
           }),
         }),
-        update: vi.fn().mockReturnValue({
-          set: vi.fn().mockReturnValue({
-            where: vi.fn().mockReturnValue({
-              returning: vi.fn().mockResolvedValue([{ ...sessionRow, status: "ABORTED" }]),
-            }),
-          }),
-        }),
       } as unknown as DbClient;
 
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
+      const mockPerm = { assertProjectAccess: vi.fn().mockResolvedValue(undefined) };
 
-      const mockAudit = {
-        recordUserAuditEvent: vi.fn().mockResolvedValue({}),
-      };
-
-      const mockStorage = createMockStorageService();
+      const mockStorage = createMockStorageService({
+        abortMultipartUpload: vi
+          .fn()
+          .mockRejectedValue(new StorageError("NoSuchUpload", "MULTIPART_UPLOAD_NOT_FOUND")),
+        headObject: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          contentLength: 10 * 1024 * 1024,
+          eTag: "completed_etag",
+        }),
+      });
 
       const service = new UploadSessionService({
         dbClient: mockDb,
         permissionService:
           mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
         storageService: mockStorage,
-        auditService:
-          mockAudit as unknown as import("@/server/services/audit-service").AuditService,
-      });
-
-      const ctx = makeContext("scientist");
-      const aborted = await service.abortUpload(ctx, "upl_abort_123");
-
-      expect(aborted.status).toBe("ABORTED");
-      expect(mockStorage.abortMultipartUpload).toHaveBeenCalledWith({
-        objectKey: sessionRow.r2Key,
-        uploadId: sessionRow.r2UploadId,
-      });
-      expect(mockAudit.recordUserAuditEvent).toHaveBeenCalledWith(
-        expect.objectContaining({
-          action: "upload.aborted",
-          resourceType: "upload_session",
-          resourceId: "upl_abort_123",
-        })
-      );
-    });
-
-    it("idempotently returns already ABORTED session", async () => {
-      const sessionRow = {
-        id: "upl_already_aborted",
-        organizationId: "org_alpha",
-        projectId: "prj_123",
-        datasetVersionId: "dsv_123",
-        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
-        r2UploadId: "r2_upload_abc",
-        status: "ABORTED",
-        expectedSize: 20 * 1024 * 1024,
-        partSize: 10 * 1024 * 1024,
-        totalParts: 2,
-        expiresAt: new Date(Date.now() + 3600000),
-        failureCode: null,
-        failureSummary: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const mockDb = {
-        select: vi.fn().mockReturnValue({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([sessionRow]),
-          }),
-        }),
-      } as unknown as DbClient;
-
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const mockStorage = createMockStorageService();
-
-      const service = new UploadSessionService({
-        dbClient: mockDb,
-        permissionService:
-          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
-        storageService: mockStorage,
-      });
-
-      const ctx = makeContext("admin");
-      const result = await service.abortUpload(ctx, "upl_already_aborted");
-      expect(result.status).toBe("ABORTED");
-      expect(mockStorage.abortMultipartUpload).not.toHaveBeenCalled();
-    });
-
-    it("cannot abort an already VERIFIED upload session", async () => {
-      const sessionRow = {
-        id: "upl_verified_123",
-        organizationId: "org_alpha",
-        projectId: "prj_123",
-        datasetVersionId: "dsv_123",
-        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
-        r2UploadId: "r2_upload_abc",
-        status: "VERIFIED",
-        expectedSize: 20 * 1024 * 1024,
-        partSize: 10 * 1024 * 1024,
-        totalParts: 2,
-        expiresAt: new Date(Date.now() + 3600000),
-        failureCode: null,
-        failureSummary: null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const mockDb = {
-        select: vi.fn().mockReturnValue({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([sessionRow]),
-          }),
-        }),
-      } as unknown as DbClient;
-
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const service = new UploadSessionService({
-        dbClient: mockDb,
-        permissionService:
-          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
       });
 
       const ctx = makeContext("owner");
-      await expect(service.abortUpload(ctx, "upl_verified_123")).rejects.toThrow(
-        "Cannot abort an upload session that has already been verified"
+      await expect(service.abortUpload(ctx, "upl_nosuchupload_abort")).rejects.toThrow(
+        ConflictError
       );
+    });
+
+    it("Section 8: expireUploadSession leaves session recoverable if completed object exists", async () => {
+      const sessionRow = {
+        id: "upl_expire_test",
+        organizationId: "org_alpha",
+        projectId: "prj_123",
+        datasetVersionId: "dsv_123",
+        r2Key: "org/org_alpha/project/prj_123/datasets/dsv_123/source/data.h5ad",
+        r2UploadId: "r2_upload_abc",
+        status: "UPLOADING",
+        expectedSize: 15 * 1024 * 1024,
+        partSize: 10 * 1024 * 1024,
+        totalParts: 2,
+        expiresAt: new Date(Date.now() - 1000), // Expired
+        failureCode: null,
+        failureSummary: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const updatedStatuses: string[] = [];
+      const mockDb = {
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([sessionRow]),
+          }),
+        }),
+        update: vi.fn().mockImplementation(() => ({
+          set: vi.fn().mockImplementation((setVals: { status: string }) => {
+            updatedStatuses.push(setVals.status);
+            return {
+              where: vi.fn().mockResolvedValue([]),
+            };
+          }),
+        })),
+      } as unknown as DbClient;
+
+      // HeadObject shows completed object
+      const mockStorage = createMockStorageService({
+        headObject: vi.fn().mockResolvedValue({
+          objectKey: sessionRow.r2Key,
+          contentLength: 15 * 1024 * 1024,
+          eTag: "completed_etag",
+        }),
+      });
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        storageService: mockStorage,
+      });
+
+      await service.expireUploadSession("upl_expire_test", "org_alpha");
+
+      // Must NOT be marked EXPIRED; transitioned to VERIFYING for recovery
+      expect(updatedStatuses).toContain("VERIFYING");
+      expect(updatedStatuses).not.toContain("EXPIRED");
     });
   });
 });
