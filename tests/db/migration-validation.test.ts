@@ -302,4 +302,104 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       );
     });
   });
+
+  describe("Phase 2 Migration 0002 Validation", () => {
+    const phase2MigrationPath = path.resolve(
+      process.cwd(),
+      "src/server/database/migrations/0002_phase2_projects_and_datasets.sql"
+    );
+
+    it("verifies 0002 migration file exists and is readable", () => {
+      expect(fs.existsSync(phase2MigrationPath)).toBe(true);
+    });
+
+    it("verifies migration creates exactly the six required Phase 2 tables", () => {
+      const sql = fs.readFileSync(phase2MigrationPath, "utf-8");
+      const requiredTables = [
+        '"experiments"',
+        '"samples"',
+        '"datasets"',
+        '"dataset_versions"',
+        '"dataset_files"',
+        '"upload_sessions"',
+      ];
+
+      for (const table of requiredTables) {
+        expect(sql).toContain(`CREATE TABLE ${table}`);
+      }
+    });
+
+    it("verifies no Phase 1 tables are recreated or dropped in 0002 migration", () => {
+      const sql = fs.readFileSync(phase2MigrationPath, "utf-8");
+      const phase1Tables = [
+        '"account"',
+        '"invitation"',
+        '"member"',
+        '"organization"',
+        '"session"',
+        '"user"',
+        '"verification"',
+        '"organization_settings"',
+        '"project_members"',
+        '"projects"',
+        '"audit_events"',
+      ];
+
+      for (const table of phase1Tables) {
+        expect(sql).not.toContain(`CREATE TABLE ${table}`);
+      }
+      expect(sql).not.toMatch(/DROP\s+TABLE/i);
+      expect(sql).not.toMatch(/DROP\s+COLUMN/i);
+    });
+
+    it("verifies upload_sessions_status_check constraint is embedded in 0002 migration", () => {
+      const sql = fs.readFileSync(phase2MigrationPath, "utf-8");
+      expect(sql).toContain(
+        "CONSTRAINT \"upload_sessions_status_check\" CHECK (status IN ('CREATED', 'UPLOADING', 'UPLOADED', 'VERIFYING', 'VERIFIED', 'IMPORTED', 'FAILED', 'ABORTED', 'EXPIRED', 'QUARANTINED'))"
+      );
+    });
+
+    it("verifies composite foreign keys on all child Phase 2 tables", () => {
+      const sql = fs.readFileSync(phase2MigrationPath, "utf-8");
+      expect(sql).toContain(
+        'FOREIGN KEY ("project_id","organization_id") REFERENCES "public"."projects"("id","organization_id") ON DELETE cascade'
+      );
+      expect(sql).toContain(
+        'FOREIGN KEY ("experiment_id","organization_id") REFERENCES "public"."experiments"("id","organization_id") ON DELETE cascade'
+      );
+      expect(sql).toContain(
+        'FOREIGN KEY ("dataset_id","organization_id") REFERENCES "public"."datasets"("id","organization_id") ON DELETE cascade'
+      );
+      expect(sql).toContain(
+        'FOREIGN KEY ("dataset_version_id","organization_id") REFERENCES "public"."dataset_versions"("id","organization_id") ON DELETE cascade'
+      );
+    });
+
+    it("verifies composite unique constraints on Phase 2 tables", () => {
+      const sql = fs.readFileSync(phase2MigrationPath, "utf-8");
+      expect(sql).toContain(
+        'CONSTRAINT "experiments_id_org_unique" UNIQUE("id","organization_id")'
+      );
+      expect(sql).toContain(
+        'CONSTRAINT "samples_exp_key_unique" UNIQUE("experiment_id","sample_key")'
+      );
+      expect(sql).toContain('CONSTRAINT "datasets_id_org_unique" UNIQUE("id","organization_id")');
+      expect(sql).toContain(
+        'CONSTRAINT "dataset_versions_ds_num_unique" UNIQUE("dataset_id","version_number")'
+      );
+      expect(sql).toContain(
+        'CONSTRAINT "dataset_versions_id_org_unique" UNIQUE("id","organization_id")'
+      );
+      expect(sql).toContain(
+        'CONSTRAINT "dataset_files_version_key_unique" UNIQUE("dataset_version_id","r2_key")'
+      );
+    });
+
+    it("verifies absence of speculative fields in 0002 migration", () => {
+      const sql = fs.readFileSync(phase2MigrationPath, "utf-8");
+      expect(sql).not.toMatch(/"uploaded_parts"/i);
+      expect(sql).not.toMatch(/"archived_at"/i);
+      expect(sql).not.toMatch(/CREATE TYPE.*status/i);
+    });
+  });
 });
