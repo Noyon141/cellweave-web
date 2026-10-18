@@ -2,3 +2,7 @@ export * from "./auth";
 export * from "./organizations";
 export * from "./projects";
 export * from "./audit-events";
+export * from "./experiments";
+export * from "./samples";
+export * from "./datasets";
+export * from "./upload-sessions";
