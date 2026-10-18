@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run tests/unit",
     "test:auth": "vitest run tests/authorization",
+    "test:integration": "node --env-file=.env.local ./node_modules/vitest/vitest.mjs run tests/integration",
     "db:validate": "vitest run tests/db",
     "test:smoke": "playwright test"
   },
