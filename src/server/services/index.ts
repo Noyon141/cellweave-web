@@ -4,3 +4,7 @@ export * from "./invitation-service";
 export * from "./project-permission-service";
 export * from "./audit-service";
 export * from "./audit-privacy";
+export * from "./project-service";
+export * from "./experiment-service";
+export * from "./sample-service";
+export * from "./dataset-service";
