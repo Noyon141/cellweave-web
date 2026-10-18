@@ -352,7 +352,25 @@ export class UploadSessionService {
       fileName: safeFileName,
     });
 
-    // 5. Check for active upload session collision
+    // 5. Invariant Check: Verify no immutable verified dataset_file binding exists for this key
+    const existingFileRows = await this.db
+      .select({ id: datasetFiles.id })
+      .from(datasetFiles)
+      .where(
+        and(
+          eq(datasetFiles.organizationId, context.organizationId),
+          eq(datasetFiles.datasetVersionId, versionMeta.versionId),
+          eq(datasetFiles.r2Key, r2Key)
+        )
+      );
+
+    if (existingFileRows.length > 0) {
+      throw new ConflictError(
+        "An immutable verified file already exists for this dataset version and file key"
+      );
+    }
+
+    // 6. Check for active upload session collision
     const existingActive = await this.db
       .select({
         id: uploadSessions.id,
@@ -376,7 +394,7 @@ export class UploadSessionService {
       );
     }
 
-    // 6. Initiate multipart upload with R2 provider
+    // 7. Initiate multipart upload with R2 provider
     const createResult = await this.storageService.createMultipartUpload({
       objectKey: r2Key,
       contentType: parsed.data.contentType,
@@ -392,7 +410,7 @@ export class UploadSessionService {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + this.sessionTtlMs);
 
-    // 7. Insert upload session record with compensating abort on DB failure
+    // 8. Insert upload session record with compensating abort on DB failure
     let createdRow: typeof uploadSessions.$inferSelect;
     try {
       const inserted = await this.db
@@ -421,7 +439,7 @@ export class UploadSessionService {
         throw new Error("Failed to insert upload session row");
       }
       createdRow = row;
-    } catch (dbError) {
+    } catch (dbError: unknown) {
       // Compensating Action: Best-effort abort in R2 to avoid orphaned multipart uploads
       try {
         await this.storageService.abortMultipartUpload({
@@ -431,6 +449,17 @@ export class UploadSessionService {
       } catch {
         // Suppress secondary cleanup failure so original DB error propagates cleanly
       }
+
+      // Detect active-session partial unique index collision
+      const pgErr = dbError as { code?: string; constraint?: string; message?: string };
+      if (
+        pgErr.code === "23505" ||
+        (typeof pgErr.constraint === "string" &&
+          pgErr.constraint.includes("upload_sessions_active_object_unique"))
+      ) {
+        throw new ConflictError("An active upload already exists for this dataset file.");
+      }
+
       throw dbError;
     }
 

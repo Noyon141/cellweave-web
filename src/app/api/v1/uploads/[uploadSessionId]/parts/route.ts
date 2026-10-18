@@ -8,11 +8,13 @@ interface RouteParams {
   params: Promise<{ uploadSessionId: string }>;
 }
 
-const createPartsRequestSchema = z.object({
-  partNumbers: z
-    .array(z.number().int().positive("partNumber must be a positive integer"))
-    .min(1, "At least one partNumber is required"),
-});
+const createPartsRequestSchema = z
+  .object({
+    partNumbers: z
+      .array(z.number().int().positive("partNumber must be a positive integer"))
+      .min(1, "At least one partNumber is required"),
+  })
+  .strict();
 
 /**
  * POST /api/v1/uploads/[uploadSessionId]/parts

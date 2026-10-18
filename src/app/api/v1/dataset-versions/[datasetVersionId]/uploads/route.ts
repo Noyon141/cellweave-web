@@ -10,19 +10,21 @@ interface RouteParams {
   params: Promise<{ datasetVersionId: string }>;
 }
 
-const initiateUploadRequestSchema = z.object({
-  fileName: z.string().trim().min(1, "fileName is required"),
-  expectedSize: z
-    .number()
-    .int("expectedSize must be an integer")
-    .positive("expectedSize must be a positive integer"),
-  contentType: z.string().trim().min(1, "contentType is required"),
-  partSize: z
-    .number()
-    .int("partSize must be an integer")
-    .positive("partSize must be positive")
-    .optional(),
-});
+const initiateUploadRequestSchema = z
+  .object({
+    fileName: z.string().trim().min(1, "fileName is required"),
+    expectedSize: z
+      .number()
+      .int("expectedSize must be an integer")
+      .positive("expectedSize must be a positive integer"),
+    contentType: z.string().trim().min(1, "contentType is required"),
+    partSize: z
+      .number()
+      .int("partSize must be an integer")
+      .positive("partSize must be positive")
+      .optional(),
+  })
+  .strict();
 
 /**
  * POST /api/v1/dataset-versions/[datasetVersionId]/uploads

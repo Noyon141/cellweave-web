@@ -351,9 +351,12 @@ describe("UploadSessionService Unit Tests (Phase 2 Step G Hardened)", () => {
       });
     });
 
-    it("Section 10: demonstrates duplicate active session concurrency behavior", async () => {
-      // Simulating concurrent execution where both select queries execute before either inserts
-      let selectCount = 0;
+    it("Step H.5: rejects initiateUpload before R2 creation if immutable verified dataset_file exists", async () => {
+      const mockStorage = createMockStorageService();
+      const mockPerm = { assertProjectAccess: vi.fn().mockResolvedValue(undefined) };
+      const mockAudit = { recordUserAuditEvent: vi.fn().mockResolvedValue({}) };
+
+      let queryIndex = 0;
       const mockDb = {
         select: vi.fn().mockImplementation(() => ({
           from: vi.fn().mockReturnValue({
@@ -371,31 +374,16 @@ describe("UploadSessionService Unit Tests (Phase 2 Step G Hardened)", () => {
               }),
             }),
             where: vi.fn().mockImplementation(async () => {
-              selectCount++;
-              // Both concurrent callers see no active session
+              queryIndex++;
+              if (queryIndex === 1) {
+                // First query is datasetFiles check: return an existing verified file!
+                return [{ id: "dsf_existing_123" }];
+              }
               return [];
             }),
           }),
         })),
-        insert: vi.fn().mockReturnValue({
-          values: vi.fn().mockImplementation((vals: Record<string, unknown>) => ({
-            returning: vi.fn().mockResolvedValue([
-              {
-                ...vals,
-                createdAt: new Date(),
-                updatedAt: new Date(),
-              },
-            ]),
-          })),
-        }),
       } as unknown as DbClient;
-
-      const mockPerm = {
-        assertProjectAccess: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const mockStorage = createMockStorageService();
-      const mockAudit = { recordUserAuditEvent: vi.fn().mockResolvedValue({}) };
 
       const service = new UploadSessionService({
         dbClient: mockDb,
@@ -408,25 +396,91 @@ describe("UploadSessionService Unit Tests (Phase 2 Step G Hardened)", () => {
 
       const ctx = makeContext("owner");
 
-      // Concurrent invocation
-      const [res1, res2] = await Promise.all([
+      await expect(
         service.initiateUpload(ctx, {
           datasetVersionId: "dsv_123",
-          fileName: "concurrent.h5ad",
+          fileName: "immutable.h5ad",
           expectedSize: 20 * 1024 * 1024,
           contentType: "application/octet-stream",
-        }),
-        service.initiateUpload(ctx, {
-          datasetVersionId: "dsv_123",
-          fileName: "concurrent.h5ad",
-          expectedSize: 20 * 1024 * 1024,
-          contentType: "application/octet-stream",
-        }),
-      ]);
+        })
+      ).rejects.toThrow(
+        "An immutable verified file already exists for this dataset version and file key"
+      );
 
-      // Both succeeded under application-level check only; documents the race condition
-      expect(res1.id).not.toBe(res2.id);
-      expect(selectCount).toBe(2);
+      // INVARIANT: createMultipartUpload was NEVER called
+      expect(mockStorage.createMultipartUpload).not.toHaveBeenCalled();
+    });
+
+    it("Step H.5: aborts R2 multipart and maps DB unique collision (23505) to ConflictError", async () => {
+      const mockStorage = createMockStorageService();
+      const mockPerm = { assertProjectAccess: vi.fn().mockResolvedValue(undefined) };
+      const mockAudit = { recordUserAuditEvent: vi.fn().mockResolvedValue({}) };
+
+      const mockDb = {
+        select: vi.fn().mockImplementation(() => ({
+          from: vi.fn().mockReturnValue({
+            innerJoin: vi.fn().mockReturnValue({
+              innerJoin: vi.fn().mockReturnValue({
+                where: vi.fn().mockResolvedValue([
+                  {
+                    versionId: "dsv_123",
+                    datasetId: "ds_123",
+                    projectId: "prj_123",
+                    projectStatus: "active",
+                    projectArchivedAt: null,
+                  },
+                ]),
+              }),
+            }),
+            where: vi.fn().mockResolvedValue([]),
+          }),
+        })),
+        insert: vi.fn().mockReturnValue({
+          values: vi.fn().mockReturnValue({
+            returning: vi.fn().mockRejectedValue({
+              code: "23505",
+              constraint: "upload_sessions_active_object_unique",
+              message:
+                'duplicate key value violates unique constraint "upload_sessions_active_object_unique"',
+            }),
+          }),
+        }),
+      } as unknown as DbClient;
+
+      const service = new UploadSessionService({
+        dbClient: mockDb,
+        permissionService:
+          mockPerm as unknown as import("@/server/services/project-permission-service").ProjectPermissionService,
+        storageService: mockStorage,
+        auditService:
+          mockAudit as unknown as import("@/server/services/audit-service").AuditService,
+      });
+
+      const ctx = makeContext("owner");
+
+      let errorThrown: unknown;
+      try {
+        await service.initiateUpload(ctx, {
+          datasetVersionId: "dsv_123",
+          fileName: "concurrent.h5ad",
+          expectedSize: 20 * 1024 * 1024,
+          contentType: "application/octet-stream",
+        });
+      } catch (err) {
+        errorThrown = err;
+      }
+
+      // Proves mapped to safe ConflictError
+      expect(errorThrown).toBeInstanceOf(ConflictError);
+      expect((errorThrown as ConflictError).message).toBe(
+        "An active upload already exists for this dataset file."
+      );
+
+      // Proves R2 abort compensating action was called
+      expect(mockStorage.abortMultipartUpload).toHaveBeenCalledWith({
+        objectKey: expect.stringContaining("concurrent.h5ad"),
+        uploadId: expect.any(String),
+      });
     });
   });
 

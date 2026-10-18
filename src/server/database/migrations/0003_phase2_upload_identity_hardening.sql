@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "upload_sessions_active_object_unique" ON "upload_sessions" USING btree ("organization_id","dataset_version_id","r2_key") WHERE status IN ('CREATED', 'UPLOADING', 'UPLOADED', 'VERIFYING');

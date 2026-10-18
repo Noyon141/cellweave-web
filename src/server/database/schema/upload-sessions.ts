@@ -5,6 +5,7 @@ import {
   bigint,
   timestamp,
   index,
+  uniqueIndex,
   check,
   foreignKey,
 } from "drizzle-orm/pg-core";
@@ -21,6 +22,8 @@ import { datasetVersions } from "./datasets";
  *    No uploadedParts JSONB is stored in the database.
  * 2. status check constraint matches canonical @cellweave/contracts UploadState.
  * 3. Composite FKs guarantee that upload session cannot cross tenant or project boundaries.
+ * 4. upload_sessions_active_object_unique partial unique index guarantees that at most one
+ *    active upload session exists for (organizationId, datasetVersionId, r2Key).
  */
 export const uploadSessions = pgTable(
   "upload_sessions",
@@ -61,6 +64,9 @@ export const uploadSessions = pgTable(
     index("upload_sessions_org_project_idx").on(table.organizationId, table.projectId),
     index("upload_sessions_org_version_idx").on(table.organizationId, table.datasetVersionId),
     index("upload_sessions_status_expires_idx").on(table.status, table.expiresAt),
+    uniqueIndex("upload_sessions_active_object_unique")
+      .on(table.organizationId, table.datasetVersionId, table.r2Key)
+      .where(sql`status IN ('CREATED', 'UPLOADING', 'UPLOADED', 'VERIFYING')`),
   ]
 );
 

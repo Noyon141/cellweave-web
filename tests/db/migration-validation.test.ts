@@ -402,4 +402,38 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       expect(sql).not.toMatch(/CREATE TYPE.*status/i);
     });
   });
+
+  describe("Phase 2 Hardening Migration 0003 Validation", () => {
+    const phase2HardeningMigrationPath = path.resolve(
+      process.cwd(),
+      "src/server/database/migrations/0003_phase2_upload_identity_hardening.sql"
+    );
+
+    it("verifies 0003 migration file exists and is readable", () => {
+      expect(fs.existsSync(phase2HardeningMigrationPath)).toBe(true);
+    });
+
+    it("verifies 0003 creates only the partial unique index upload_sessions_active_object_unique", () => {
+      const sql = fs.readFileSync(phase2HardeningMigrationPath, "utf-8");
+      expect(sql).toContain(
+        'CREATE UNIQUE INDEX "upload_sessions_active_object_unique" ON "upload_sessions" USING btree ("organization_id","dataset_version_id","r2_key") WHERE status IN (\'CREATED\', \'UPLOADING\', \'UPLOADED\', \'VERIFYING\');'
+      );
+      expect(sql).not.toMatch(/CREATE TABLE/i);
+      expect(sql).not.toMatch(/DROP TABLE/i);
+      expect(sql).not.toMatch(/ALTER TABLE/i);
+    });
+
+    it("verifies journal contains 0000, 0001, 0002, and 0003 in strict order", () => {
+      const journalPath = path.resolve(
+        process.cwd(),
+        "src/server/database/migrations/meta/_journal.json"
+      );
+      const journal = JSON.parse(fs.readFileSync(journalPath, "utf-8"));
+      expect(journal.entries).toHaveLength(4);
+      expect(journal.entries[0].tag).toBe("0000_phase1_identity_and_tenancy");
+      expect(journal.entries[1].tag).toBe("0001_member_organization_user_unique");
+      expect(journal.entries[2].tag).toBe("0002_phase2_projects_and_datasets");
+      expect(journal.entries[3].tag).toBe("0003_phase2_upload_identity_hardening");
+    });
+  });
 });

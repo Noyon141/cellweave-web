@@ -295,6 +295,14 @@ vi.mock("@/server/services/upload-session-service", () => {
         if (!input.fileName || input.fileName.trim() === "") {
           throw new ValidationError("fileName is required");
         }
+        if (input.fileName === "conflict_existing_file.h5ad") {
+          throw new ConflictError(
+            "An immutable verified file already exists for this dataset version and file key"
+          );
+        }
+        if (input.fileName === "conflict_active_session.h5ad") {
+          throw new ConflictError("An active upload already exists for this dataset file.");
+        }
         return Promise.resolve(mockUploadSession);
       }),
       getUploadSession: vi.fn().mockImplementation((_ctx, id) => {
@@ -631,15 +639,13 @@ describe("Phase 2 Step H — Thin Route Handlers Suite", () => {
   });
 
   describe("5. Upload Session Orchestration Routes", () => {
-    it("POST /api/v1/dataset-versions/[datasetVersionId]/uploads binds route param and omits r2UploadId", async () => {
+    it("POST /api/v1/dataset-versions/[datasetVersionId]/uploads succeeds with valid body and omits r2UploadId", async () => {
       const req = new NextRequest(
         `http://localhost/api/v1/dataset-versions/${mockDatasetVersion.id}/uploads`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            // Attacker attempts authority injection with different datasetVersionId
-            datasetVersionId: "dsv_spoofed_other_org",
             fileName: "matrix.h5ad",
             contentType: "application/x-hdf5",
             expectedSize: 10485760,
@@ -656,6 +662,87 @@ describe("Phase 2 Step H — Thin Route Handlers Suite", () => {
       // STRICT INVARIANT: r2UploadId must NEVER be returned in response DTO
       expect(json.data.r2UploadId).toBeUndefined();
       expect(JSON.stringify(json)).not.toContain("SENSITIVE_R2_UPLOAD_ID_DO_NOT_LEAK");
+    });
+
+    it("POST /api/v1/dataset-versions/[datasetVersionId]/uploads strictly rejects authority-bearing / unknown body fields with HTTP 400", async () => {
+      const rejectedFields = [
+        { datasetVersionId: "dsv_spoofed" },
+        { organizationId: "org_spoofed" },
+        { projectId: "prj_spoofed" },
+        { r2Key: "evil/key" },
+        { r2UploadId: "evil_upload_id" },
+        { status: "VERIFIED" },
+        { uploadedParts: [] },
+      ];
+
+      for (const extraField of rejectedFields) {
+        const req = new NextRequest(
+          `http://localhost/api/v1/dataset-versions/${mockDatasetVersion.id}/uploads`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              fileName: "matrix.h5ad",
+              contentType: "application/x-hdf5",
+              expectedSize: 10485760,
+              ...extraField,
+            }),
+          }
+        );
+        const res = await InitiateUploadRoute.POST(req, {
+          params: Promise.resolve({ datasetVersionId: mockDatasetVersion.id }),
+        });
+
+        expect(res.status).toBe(400);
+        const json = await res.json();
+        expect(json.error).toBe("BAD_REQUEST");
+      }
+    });
+
+    it("POST /api/v1/dataset-versions/[datasetVersionId]/uploads maps immutable verified file collision to 409", async () => {
+      const req = new NextRequest(
+        `http://localhost/api/v1/dataset-versions/${mockDatasetVersion.id}/uploads`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fileName: "conflict_existing_file.h5ad",
+            contentType: "application/x-hdf5",
+            expectedSize: 10485760,
+          }),
+        }
+      );
+      const res = await InitiateUploadRoute.POST(req, {
+        params: Promise.resolve({ datasetVersionId: mockDatasetVersion.id }),
+      });
+
+      expect(res.status).toBe(409);
+      const json = await res.json();
+      expect(json.error).toBe("CONFLICT");
+      expect(json.message).toContain("immutable verified file already exists");
+    });
+
+    it("POST /api/v1/dataset-versions/[datasetVersionId]/uploads maps active upload collision to 409", async () => {
+      const req = new NextRequest(
+        `http://localhost/api/v1/dataset-versions/${mockDatasetVersion.id}/uploads`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fileName: "conflict_active_session.h5ad",
+            contentType: "application/x-hdf5",
+            expectedSize: 10485760,
+          }),
+        }
+      );
+      const res = await InitiateUploadRoute.POST(req, {
+        params: Promise.resolve({ datasetVersionId: mockDatasetVersion.id }),
+      });
+
+      expect(res.status).toBe(409);
+      const json = await res.json();
+      expect(json.error).toBe("CONFLICT");
+      expect(json.message).toBe("An active upload already exists for this dataset file.");
     });
 
     it("POST /api/v1/dataset-versions/[datasetVersionId]/uploads validates input parameters", async () => {
