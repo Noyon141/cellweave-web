@@ -8,10 +8,7 @@ import { ProjectPermissionService } from "@/server/services/project-permission-s
 import { AuditService } from "@/server/services/audit-service";
 import { R2StorageService } from "@/server/integrations/storage/r2-storage-service";
 import { getR2Client } from "@/server/integrations/storage/r2-client";
-import {
-  DeleteObjectCommand,
-  ListMultipartUploadsCommand,
-} from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, ListMultipartUploadsCommand } from "@aws-sdk/client-s3";
 import type { TenantContext } from "@/types";
 import { ConflictError } from "@/server/authorization/errors";
 
