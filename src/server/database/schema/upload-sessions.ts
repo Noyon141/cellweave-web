@@ -6,6 +6,7 @@ import {
   timestamp,
   index,
   uniqueIndex,
+  unique,
   check,
   foreignKey,
 } from "drizzle-orm/pg-core";
@@ -47,6 +48,12 @@ export const uploadSessions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
+    unique("upload_sessions_id_org_ver_r2_unique").on(
+      table.id,
+      table.organizationId,
+      table.datasetVersionId,
+      table.r2Key
+    ),
     foreignKey({
       columns: [table.projectId, table.organizationId],
       foreignColumns: [projects.id, projects.organizationId],

@@ -29,6 +29,13 @@
       "when": 1792341473361,
       "tag": "0003_phase2_upload_identity_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1792400000000,
+      "tag": "0004_phase3_import_persistence_and_security",
+      "breakpoints": true
     }
   ]
 }

@@ -423,17 +423,141 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       expect(sql).not.toMatch(/ALTER TABLE/i);
     });
 
-    it("verifies journal contains 0000, 0001, 0002, and 0003 in strict order", () => {
+    it("verifies journal contains 0000, 0001, 0002, 0003, and 0004 in strict order", () => {
       const journalPath = path.resolve(
         process.cwd(),
         "src/server/database/migrations/meta/_journal.json"
       );
       const journal = JSON.parse(fs.readFileSync(journalPath, "utf-8"));
-      expect(journal.entries).toHaveLength(4);
+      expect(journal.entries).toHaveLength(5);
       expect(journal.entries[0].tag).toBe("0000_phase1_identity_and_tenancy");
       expect(journal.entries[1].tag).toBe("0001_member_organization_user_unique");
       expect(journal.entries[2].tag).toBe("0002_phase2_projects_and_datasets");
       expect(journal.entries[3].tag).toBe("0003_phase2_upload_identity_hardening");
+      expect(journal.entries[4].tag).toBe("0004_phase3_import_persistence_and_security");
+    });
+  });
+
+  describe("Phase 3 Migration 0004 Validation", () => {
+    const phase3MigrationPath = path.resolve(
+      process.cwd(),
+      "src/server/database/migrations/0004_phase3_import_persistence_and_security.sql"
+    );
+
+    it("verifies 0004 migration file exists and is readable", () => {
+      expect(fs.existsSync(phase3MigrationPath)).toBe(true);
+    });
+
+    it("verifies migration creates all three Phase 3 tables", () => {
+      const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
+      const requiredTables = [
+        '"dataset_file_provenance"',
+        '"dataset_imports"',
+        '"dataset_import_files"',
+      ];
+
+      for (const table of requiredTables) {
+        expect(sql).toContain(`CREATE TABLE ${table}`);
+      }
+    });
+
+    it("verifies candidate keys added to dataset_files and upload_sessions", () => {
+      const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
+      expect(sql).toContain(
+        'ALTER TABLE "dataset_files" ADD CONSTRAINT "dataset_files_id_org_unique" UNIQUE("id","organization_id")'
+      );
+      expect(sql).toContain(
+        'ALTER TABLE "dataset_files" ADD CONSTRAINT "dataset_files_id_org_version_unique" UNIQUE("id","organization_id","dataset_version_id")'
+      );
+      expect(sql).toContain(
+        'ALTER TABLE "dataset_files" ADD CONSTRAINT "dataset_files_id_org_ver_r2_unique" UNIQUE("id","organization_id","dataset_version_id","r2_key")'
+      );
+      expect(sql).toContain(
+        'ALTER TABLE "upload_sessions" ADD CONSTRAINT "upload_sessions_id_org_ver_r2_unique" UNIQUE("id","organization_id","dataset_version_id","r2_key")'
+      );
+    });
+
+    it("verifies check constraints on Phase 3 tables", () => {
+      const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
+      expect(sql).toContain(
+        "CONSTRAINT \"dataset_file_provenance_sha256_check\" CHECK (sha256 ~ '^[0-9a-f]{64}$')"
+      );
+      expect(sql).toContain(
+        "CONSTRAINT \"dataset_file_provenance_compression_check\" CHECK (compression IN ('NONE', 'GZIP'))"
+      );
+      expect(sql).toContain(
+        "CONSTRAINT \"dataset_imports_source_format_check\" CHECK (source_format IN ('H5AD', 'TENX_H5', 'TENX_MTX', 'GENERIC_MATRIX'))"
+      );
+      expect(sql).toContain(
+        "CONSTRAINT \"dataset_imports_source_checksum_check\" CHECK (source_checksum ~ '^[0-9a-f]{64}$')"
+      );
+      expect(sql).toContain(
+        "CONSTRAINT \"dataset_import_files_role_check\" CHECK (role IN ('PRIMARY', 'MATRIX', 'FEATURES', 'BARCODES', 'CELL_METADATA', 'FEATURE_METADATA'))"
+      );
+      expect(sql).toContain('CONSTRAINT "dataset_import_files_ordinal_check" CHECK (ordinal >= 0)');
+    });
+
+    it("verifies composite foreign keys enforce tenant safety", () => {
+      const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
+      expect(sql).toContain(
+        'FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id","r2_key")'
+      );
+      expect(sql).toContain(
+        'FOREIGN KEY ("upload_session_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."upload_sessions"("id","organization_id","dataset_version_id","r2_key")'
+      );
+      expect(sql).toContain(
+        'FOREIGN KEY ("dataset_version_id","organization_id") REFERENCES "public"."dataset_versions"("id","organization_id")'
+      );
+      expect(sql).toContain(
+        'FOREIGN KEY ("import_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_imports"("id","organization_id","dataset_version_id")'
+      );
+      expect(sql).toContain(
+        'FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id")'
+      );
+    });
+
+    it("verifies finalize_dataset_version_import stored procedure invariants", () => {
+      const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
+      expect(sql).toContain("CREATE OR REPLACE FUNCTION finalize_dataset_version_import");
+      expect(sql).toContain("SECURITY DEFINER");
+      expect(sql).toContain("SET search_path = public, pg_temp");
+      expect(sql).toContain(
+        "org/' || p_organization_id || '/project/' || v_project_id || '/datasets/' || p_dataset_version_id || '/canonical/canonical.h5ad"
+      );
+      expect(sql).toContain("status := 'ALREADY_FINALIZED'");
+      expect(sql).toContain("status := 'FINALIZED'");
+      expect(sql).toContain("action,\n    resource_type,\n    resource_id");
+      expect(sql).toContain("'dataset.imported'");
+    });
+
+    it("verifies database security roles and explicit grants", () => {
+      const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
+      expect(sql).toContain("CREATE ROLE cellweave_import_finalizer");
+      expect(sql).toContain("CREATE ROLE cellweave_app_runtime");
+      expect(sql).toContain(
+        'GRANT SELECT, INSERT ON TABLE "dataset_file_provenance", "dataset_imports", "dataset_import_files" TO cellweave_import_finalizer;'
+      );
+      expect(sql).toContain(
+        "GRANT EXECUTE ON FUNCTION finalize_dataset_version_import TO cellweave_import_finalizer;"
+      );
+      expect(sql).toContain(
+        'GRANT SELECT ON TABLE "dataset_file_provenance", "dataset_imports", "dataset_import_files" TO cellweave_app_runtime;'
+      );
+      expect(sql).toContain(
+        'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE "dataset_file_provenance", "dataset_imports", "dataset_import_files" FROM cellweave_app_runtime;'
+      );
+      expect(sql).toContain(
+        "REVOKE EXECUTE ON FUNCTION finalize_dataset_version_import FROM cellweave_app_runtime;"
+      );
+      expect(sql).toContain(
+        "REVOKE EXECUTE ON FUNCTION finalize_dataset_version_import FROM PUBLIC;"
+      );
+    });
+
+    it("verifies no drop statements exist in 0004 migration", () => {
+      const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
+      expect(sql).not.toMatch(/DROP\s+TABLE/i);
+      expect(sql).not.toMatch(/DROP\s+COLUMN/i);
     });
   });
 });

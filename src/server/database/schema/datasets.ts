@@ -112,6 +112,18 @@ export const datasetFiles = pgTable(
   },
   (table) => [
     unique("dataset_files_version_key_unique").on(table.datasetVersionId, table.r2Key),
+    unique("dataset_files_id_org_unique").on(table.id, table.organizationId),
+    unique("dataset_files_id_org_version_unique").on(
+      table.id,
+      table.organizationId,
+      table.datasetVersionId
+    ),
+    unique("dataset_files_id_org_ver_r2_unique").on(
+      table.id,
+      table.organizationId,
+      table.datasetVersionId,
+      table.r2Key
+    ),
     foreignKey({
       columns: [table.datasetVersionId, table.organizationId],
       foreignColumns: [datasetVersions.id, datasetVersions.organizationId],

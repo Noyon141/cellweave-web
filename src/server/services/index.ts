@@ -9,3 +9,4 @@ export * from "./experiment-service";
 export * from "./sample-service";
 export * from "./dataset-service";
 export * from "./upload-session-service";
+export * from "./dataset-import-service";
