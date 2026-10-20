@@ -27,6 +27,12 @@ export const STORAGE_DEFAULTS = {
   PRESIGNED_UPLOAD_PART_EXPIRES_SECONDS: 15 * 60,
   /** Default lifetime for presigned Download URLs: 5 minutes (300 seconds) */
   PRESIGNED_DOWNLOAD_EXPIRES_SECONDS: 5 * 60,
+  /** Default lifetime for internal canonical publication capabilities: 15 minutes (900 seconds) */
+  CANONICAL_PUBLICATION_CAPABILITY_EXPIRES_SECONDS: 15 * 60,
+  /** Maximum allowed lifetime for internal canonical publication capabilities: 1 hour (3600 seconds) */
+  MAX_CANONICAL_PUBLICATION_CAPABILITY_EXPIRES_SECONDS: 60 * 60,
+  /** Canonical H5AD MIME type */
+  CANONICAL_H5AD_CONTENT_TYPE: "application/x-hdf5",
   /** Maximum allowed filename length in UTF-8 bytes/characters */
   MAX_FILENAME_LENGTH: 255,
 } as const;

@@ -28,6 +28,9 @@ export type {
   ArtifactManifest,
   OrganizationRole,
   TenantContext,
+  CanonicalArtifactPublicationCapabilities,
+  CanonicalArtifactPublicationResult,
+  CanonicalArtifactPublicationStatus,
 } from "@cellweave/contracts";
 
 export {
@@ -39,4 +42,5 @@ export {
   ARTIFACT_TYPES,
   SCIENTIFIC_JOB_TYPES,
   ORGANIZATION_ROLES,
+  CANONICAL_ARTIFACT_PUBLICATION_STATUSES,
 } from "@cellweave/contracts";

@@ -7,6 +7,50 @@ export interface BuildDatasetSourceObjectKeyParams {
   readonly fileName: string;
 }
 
+export interface BuildCanonicalDatasetObjectKeyParams {
+  readonly organizationId: string;
+  readonly projectId: string;
+  readonly datasetVersionId: string;
+}
+
+/**
+ * Validates a tenant/project/datasetVersion identifier segment for safe R2 object key construction.
+ */
+function assertSafeObjectKeyIdentifier(value: string, fieldName: string): string {
+  if (!value || typeof value !== "string" || value.trim().length === 0) {
+    throw new StorageError(
+      `${fieldName} is required for object key construction`,
+      "INVALID_OBJECT_KEY"
+    );
+  }
+
+  if (value !== value.trim() || /\s/.test(value)) {
+    throw new StorageError(
+      `${fieldName} cannot contain whitespace characters`,
+      "INVALID_OBJECT_KEY"
+    );
+  }
+
+  if (/[\x00-\x1f\x7f]/.test(value)) {
+    throw new StorageError(
+      `${fieldName} contains prohibited control or NUL characters`,
+      "INVALID_OBJECT_KEY"
+    );
+  }
+
+  if (
+    value === "." ||
+    value === ".." ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.includes("..")
+  ) {
+    throw new StorageError(`${fieldName} contains invalid path characters`, "INVALID_OBJECT_KEY");
+  }
+
+  return value;
+}
+
 /**
  * Normalizes and validates user-supplied file names for safe object storage.
  *
@@ -88,52 +132,30 @@ export function normalizeSafeFileName(rawFileName: string): string {
 export function buildDatasetSourceObjectKey(params: BuildDatasetSourceObjectKeyParams): string {
   const { organizationId, projectId, datasetVersionId, fileName } = params;
 
-  if (!organizationId || typeof organizationId !== "string" || organizationId.trim().length === 0) {
-    throw new StorageError(
-      "organizationId is required for object key construction",
-      "INVALID_OBJECT_KEY"
-    );
-  }
-  if (!projectId || typeof projectId !== "string" || projectId.trim().length === 0) {
-    throw new StorageError(
-      "projectId is required for object key construction",
-      "INVALID_OBJECT_KEY"
-    );
-  }
-  if (
-    !datasetVersionId ||
-    typeof datasetVersionId !== "string" ||
-    datasetVersionId.trim().length === 0
-  ) {
-    throw new StorageError(
-      "datasetVersionId is required for object key construction",
-      "INVALID_OBJECT_KEY"
-    );
-  }
-
-  // Prevent injection in ID strings
-  if (
-    organizationId.includes("/") ||
-    organizationId.includes("\\") ||
-    organizationId.includes("..")
-  ) {
-    throw new StorageError("organizationId contains invalid path characters", "INVALID_OBJECT_KEY");
-  }
-  if (projectId.includes("/") || projectId.includes("\\") || projectId.includes("..")) {
-    throw new StorageError("projectId contains invalid path characters", "INVALID_OBJECT_KEY");
-  }
-  if (
-    datasetVersionId.includes("/") ||
-    datasetVersionId.includes("\\") ||
-    datasetVersionId.includes("..")
-  ) {
-    throw new StorageError(
-      "datasetVersionId contains invalid path characters",
-      "INVALID_OBJECT_KEY"
-    );
-  }
-
+  const safeOrgId = assertSafeObjectKeyIdentifier(organizationId, "organizationId");
+  const safeProjectId = assertSafeObjectKeyIdentifier(projectId, "projectId");
+  const safeVersionId = assertSafeObjectKeyIdentifier(datasetVersionId, "datasetVersionId");
   const safeFileName = normalizeSafeFileName(fileName);
 
-  return `org/${organizationId}/project/${projectId}/datasets/${datasetVersionId}/source/${safeFileName}`;
+  return `org/${safeOrgId}/project/${safeProjectId}/datasets/${safeVersionId}/source/${safeFileName}`;
+}
+
+/**
+ * Builds the deterministic canonical dataset artifact object key in Cloudflare R2.
+ *
+ * Pattern: org/{organizationId}/project/{projectId}/datasets/{datasetVersionId}/canonical/canonical.h5ad
+ *
+ * Invariants:
+ * 1. Matches the exact SQL invariant in `finalize_dataset_version_import`.
+ * 2. Derived strictly by the trusted control plane; never constructed by science or supplied by clients.
+ * 3. Rejects traversal, path separators, whitespace, and control characters in all identifier segments.
+ */
+export function buildCanonicalDatasetKey(params: BuildCanonicalDatasetObjectKeyParams): string {
+  const { organizationId, projectId, datasetVersionId } = params;
+
+  const safeOrgId = assertSafeObjectKeyIdentifier(organizationId, "organizationId");
+  const safeProjectId = assertSafeObjectKeyIdentifier(projectId, "projectId");
+  const safeVersionId = assertSafeObjectKeyIdentifier(datasetVersionId, "datasetVersionId");
+
+  return `org/${safeOrgId}/project/${safeProjectId}/datasets/${safeVersionId}/canonical/canonical.h5ad`;
 }

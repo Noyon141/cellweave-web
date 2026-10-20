@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   normalizeSafeFileName,
   buildDatasetSourceObjectKey,
+  buildCanonicalDatasetKey,
 } from "@/server/integrations/storage/object-key";
 import { StorageError } from "@/server/integrations/storage/storage-types";
 
@@ -106,6 +107,59 @@ describe("Object Key & Safe File Name Security (Step E)", () => {
           fileName: "data.h5ad",
         })
       ).toThrow(StorageError);
+    });
+  });
+
+  describe("buildCanonicalDatasetKey", () => {
+    it("builds the exact canonical artifact key format and uses projectId (never datasetId)", () => {
+      const key = buildCanonicalDatasetKey({
+        organizationId: "org_alpha",
+        projectId: "prj_real_123",
+        datasetVersionId: "dsv_789",
+      });
+
+      expect(key).toBe(
+        "org/org_alpha/project/prj_real_123/datasets/dsv_789/canonical/canonical.h5ad"
+      );
+      expect(key).toContain("prj_real_123");
+      expect(key).not.toContain("ds_wrong_456");
+    });
+
+    it("rejects empty, whitespace, control, or traversal characters in identifiers", () => {
+      for (const badId of [
+        "",
+        "   ",
+        "id/evil",
+        "id\\evil",
+        "..",
+        "id..2",
+        "id with space",
+        "id\0null",
+      ]) {
+        expect(() =>
+          buildCanonicalDatasetKey({
+            organizationId: badId,
+            projectId: "prj_123",
+            datasetVersionId: "dsv_789",
+          })
+        ).toThrow(StorageError);
+
+        expect(() =>
+          buildCanonicalDatasetKey({
+            organizationId: "org_123",
+            projectId: badId,
+            datasetVersionId: "dsv_789",
+          })
+        ).toThrow(StorageError);
+
+        expect(() =>
+          buildCanonicalDatasetKey({
+            organizationId: "org_123",
+            projectId: "prj_123",
+            datasetVersionId: badId,
+          })
+        ).toThrow(StorageError);
+      }
     });
   });
 });
