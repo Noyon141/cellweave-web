@@ -49,7 +49,7 @@ export const datasetFileProvenance = pgTable(
         datasetFiles.r2Key,
       ],
       name: "dataset_file_provenance_file_org_fk",
-    }).onDelete("cascade"),
+    }).onDelete("restrict"),
     foreignKey({
       columns: [table.uploadSessionId, table.organizationId, table.datasetVersionId, table.r2Key],
       foreignColumns: [
@@ -98,7 +98,7 @@ export const datasetImports = pgTable(
       columns: [table.datasetVersionId, table.organizationId],
       foreignColumns: [datasetVersions.id, datasetVersions.organizationId],
       name: "dataset_imports_version_org_fk",
-    }).onDelete("cascade"),
+    }).onDelete("restrict"),
     check(
       "dataset_imports_source_format_check",
       sql`source_format IN ('H5AD', 'TENX_H5', 'TENX_MTX', 'GENERIC_MATRIX')`
@@ -145,12 +145,12 @@ export const datasetImportFiles = pgTable(
         datasetImports.datasetVersionId,
       ],
       name: "dataset_import_files_import_fk",
-    }).onDelete("cascade"),
+    }).onDelete("restrict"),
     foreignKey({
       columns: [table.datasetFileId, table.organizationId, table.datasetVersionId],
       foreignColumns: [datasetFiles.id, datasetFiles.organizationId, datasetFiles.datasetVersionId],
       name: "dataset_import_files_file_fk",
-    }).onDelete("cascade"),
+    }).onDelete("restrict"),
     check(
       "dataset_import_files_role_check",
       sql`role IN ('PRIMARY', 'MATRIX', 'FEATURES', 'BARCODES', 'CELL_METADATA', 'FEATURE_METADATA')`

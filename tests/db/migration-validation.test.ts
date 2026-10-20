@@ -497,22 +497,32 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
       expect(sql).toContain('CONSTRAINT "dataset_import_files_ordinal_check" CHECK (ordinal >= 0)');
     });
 
-    it("verifies composite foreign keys enforce tenant safety", () => {
+    it("verifies composite foreign keys enforce tenant safety and ON DELETE RESTRICT for immutable provenance", () => {
       const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
       expect(sql).toContain(
-        'FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id","r2_key")'
+        'FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id","r2_key") ON DELETE restrict'
       );
       expect(sql).toContain(
-        'FOREIGN KEY ("upload_session_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."upload_sessions"("id","organization_id","dataset_version_id","r2_key")'
+        'FOREIGN KEY ("upload_session_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."upload_sessions"("id","organization_id","dataset_version_id","r2_key") ON DELETE restrict'
       );
       expect(sql).toContain(
-        'FOREIGN KEY ("dataset_version_id","organization_id") REFERENCES "public"."dataset_versions"("id","organization_id")'
+        'FOREIGN KEY ("dataset_version_id","organization_id") REFERENCES "public"."dataset_versions"("id","organization_id") ON DELETE restrict'
       );
       expect(sql).toContain(
-        'FOREIGN KEY ("import_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_imports"("id","organization_id","dataset_version_id")'
+        'FOREIGN KEY ("import_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_imports"("id","organization_id","dataset_version_id") ON DELETE restrict'
       );
       expect(sql).toContain(
-        'FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id")'
+        'FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id") ON DELETE restrict'
+      );
+    });
+
+    it("verifies GENERIC_MATRIX exact cardinality enforcement in stored procedure", () => {
+      const sql = fs.readFileSync(phase3MigrationPath, "utf-8");
+      expect(sql).toContain(
+        "v_matrix_count <> 1 OR v_cell_meta_count > 1 OR v_feat_meta_count > 1"
+      );
+      expect(sql).toContain(
+        "CARDINALITY_ERROR: GENERIC_MATRIX import requires exactly 1 MATRIX file, at most 1 CELL_METADATA, at most 1 FEATURE_METADATA, and no other roles"
       );
     });
 

@@ -45,13 +45,13 @@ CREATE TABLE "dataset_import_files" (
 	CONSTRAINT "dataset_import_files_ordinal_check" CHECK (ordinal >= 0)
 );--> statement-breakpoint
 ALTER TABLE "dataset_file_provenance" ADD CONSTRAINT "dataset_file_provenance_organization_id_fk" FOREIGN KEY ("organization_id") REFERENCES "public"."organization"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "dataset_file_provenance" ADD CONSTRAINT "dataset_file_provenance_file_org_fk" FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id","r2_key") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "dataset_file_provenance" ADD CONSTRAINT "dataset_file_provenance_file_org_fk" FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id","r2_key") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "dataset_file_provenance" ADD CONSTRAINT "dataset_file_provenance_session_org_fk" FOREIGN KEY ("upload_session_id","organization_id","dataset_version_id","r2_key") REFERENCES "public"."upload_sessions"("id","organization_id","dataset_version_id","r2_key") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "dataset_imports" ADD CONSTRAINT "dataset_imports_organization_id_fk" FOREIGN KEY ("organization_id") REFERENCES "public"."organization"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "dataset_imports" ADD CONSTRAINT "dataset_imports_version_org_fk" FOREIGN KEY ("dataset_version_id","organization_id") REFERENCES "public"."dataset_versions"("id","organization_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "dataset_imports" ADD CONSTRAINT "dataset_imports_version_org_fk" FOREIGN KEY ("dataset_version_id","organization_id") REFERENCES "public"."dataset_versions"("id","organization_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "dataset_import_files" ADD CONSTRAINT "dataset_import_files_organization_id_fk" FOREIGN KEY ("organization_id") REFERENCES "public"."organization"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "dataset_import_files" ADD CONSTRAINT "dataset_import_files_import_fk" FOREIGN KEY ("import_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_imports"("id","organization_id","dataset_version_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "dataset_import_files" ADD CONSTRAINT "dataset_import_files_file_fk" FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "dataset_import_files" ADD CONSTRAINT "dataset_import_files_import_fk" FOREIGN KEY ("import_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_imports"("id","organization_id","dataset_version_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "dataset_import_files" ADD CONSTRAINT "dataset_import_files_file_fk" FOREIGN KEY ("dataset_file_id","organization_id","dataset_version_id") REFERENCES "public"."dataset_files"("id","organization_id","dataset_version_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "dataset_file_provenance_org_ver_idx" ON "dataset_file_provenance" USING btree ("organization_id","dataset_version_id");--> statement-breakpoint
 CREATE INDEX "dataset_imports_org_ver_idx" ON "dataset_imports" USING btree ("organization_id","dataset_version_id");--> statement-breakpoint
 CREATE INDEX "dataset_import_files_org_ver_idx" ON "dataset_import_files" USING btree ("organization_id","dataset_version_id");--> statement-breakpoint
@@ -93,7 +93,15 @@ DECLARE
   v_versions_updated integer;
   v_finalized_at timestamptz;
   v_audit_id text;
+  v_primary_count integer;
+  v_matrix_count integer;
+  v_features_count integer;
+  v_barcodes_count integer;
+  v_cell_meta_count integer;
+  v_feat_meta_count integer;
+  v_unrelated_count integer;
 BEGIN
+  -- Strict validation of caller inputs
   IF p_organization_id IS NULL OR p_dataset_version_id IS NULL THEN
     RAISE EXCEPTION 'INVALID_ARGUMENT: organization_id and dataset_version_id are required';
   END IF;
@@ -118,12 +126,16 @@ BEGIN
     RAISE EXCEPTION 'INVALID_ARGUMENT: gene_id_scheme is required';
   END IF;
 
+  -- Derive projectId authoritatively via tenant-safe join across versions, datasets, and projects
   SELECT d.project_id
   INTO v_project_id
-  FROM dataset_versions dv
-  JOIN datasets d
+  FROM public.dataset_versions dv
+  JOIN public.datasets d
     ON d.id = dv.dataset_id
    AND d.organization_id = dv.organization_id
+  JOIN public.projects p
+    ON p.id = d.project_id
+   AND p.organization_id = d.organization_id
   WHERE dv.id = p_dataset_version_id
     AND dv.organization_id = p_organization_id;
 
@@ -132,18 +144,22 @@ BEGIN
       p_dataset_version_id, p_organization_id;
   END IF;
 
+  -- Canonical artifact key invariant:
+  -- org/{organizationId}/project/{projectId}/datasets/{datasetVersionId}/canonical/canonical.h5ad
   v_canonical_artifact_key := 'org/' || p_organization_id || '/project/' || v_project_id || '/datasets/' || p_dataset_version_id || '/canonical/canonical.h5ad';
 
+  -- Row-level lock on dataset_versions to serialize concurrent finalization attempts
   SELECT *
   INTO v_version_record
-  FROM dataset_versions
+  FROM public.dataset_versions
   WHERE id = p_dataset_version_id
     AND organization_id = p_organization_id
   FOR UPDATE;
 
+  -- Authoritative import manifest root lookup
   SELECT di.id, di.source_format, di.source_checksum
   INTO v_import_id, v_import_format, v_import_source_checksum
-  FROM dataset_imports di
+  FROM public.dataset_imports di
   WHERE di.dataset_version_id = p_dataset_version_id
     AND di.organization_id = p_organization_id;
 
@@ -157,6 +173,7 @@ BEGIN
       v_version_record.source_format, v_import_format;
   END IF;
 
+  -- Idempotent replay: If already finalized, verify all fields match identically
   IF v_version_record.canonical_checksum IS NOT NULL THEN
     IF v_version_record.canonical_format = 'H5AD'
        AND v_version_record.canonical_checksum = p_canonical_checksum
@@ -177,9 +194,26 @@ BEGIN
     END IF;
   END IF;
 
-  SELECT COUNT(*)
-  INTO v_manifest_file_count
-  FROM dataset_import_files dif
+  -- Inspect exact role distribution in import manifest
+  SELECT
+    COUNT(*),
+    COUNT(*) FILTER (WHERE role = 'PRIMARY'),
+    COUNT(*) FILTER (WHERE role = 'MATRIX'),
+    COUNT(*) FILTER (WHERE role = 'FEATURES'),
+    COUNT(*) FILTER (WHERE role = 'BARCODES'),
+    COUNT(*) FILTER (WHERE role = 'CELL_METADATA'),
+    COUNT(*) FILTER (WHERE role = 'FEATURE_METADATA'),
+    COUNT(*) FILTER (WHERE role NOT IN ('PRIMARY', 'MATRIX', 'FEATURES', 'BARCODES', 'CELL_METADATA', 'FEATURE_METADATA'))
+  INTO
+    v_manifest_file_count,
+    v_primary_count,
+    v_matrix_count,
+    v_features_count,
+    v_barcodes_count,
+    v_cell_meta_count,
+    v_feat_meta_count,
+    v_unrelated_count
+  FROM public.dataset_import_files dif
   WHERE dif.import_id = v_import_id
     AND dif.organization_id = p_organization_id
     AND dif.dataset_version_id = p_dataset_version_id;
@@ -188,18 +222,38 @@ BEGIN
     RAISE EXCEPTION 'IMPORT_EMPTY: import manifest % has no files', v_import_id;
   END IF;
 
-  IF v_import_format = 'H5AD' AND v_manifest_file_count <> 1 THEN
-    RAISE EXCEPTION 'CARDINALITY_ERROR: H5AD import requires exactly 1 PRIMARY file, found %', v_manifest_file_count;
-  ELSIF v_import_format = 'TENX_H5' AND v_manifest_file_count <> 1 THEN
-    RAISE EXCEPTION 'CARDINALITY_ERROR: TENX_H5 import requires exactly 1 PRIMARY file, found %', v_manifest_file_count;
-  ELSIF v_import_format = 'TENX_MTX' AND v_manifest_file_count <> 3 THEN
-    RAISE EXCEPTION 'CARDINALITY_ERROR: TENX_MTX import requires exactly 3 files (MATRIX, FEATURES, BARCODES), found %', v_manifest_file_count;
+  IF v_unrelated_count > 0 THEN
+    RAISE EXCEPTION 'CARDINALITY_ERROR: manifest contains % invalid roles', v_unrelated_count;
   END IF;
 
+  -- Strict format cardinality verification
+  IF v_import_format = 'H5AD' THEN
+    IF v_primary_count <> 1 OR v_manifest_file_count <> 1 THEN
+      RAISE EXCEPTION 'CARDINALITY_ERROR: H5AD import requires exactly 1 PRIMARY file, found % (total %)', v_primary_count, v_manifest_file_count;
+    END IF;
+  ELSIF v_import_format = 'TENX_H5' THEN
+    IF v_primary_count <> 1 OR v_manifest_file_count <> 1 THEN
+      RAISE EXCEPTION 'CARDINALITY_ERROR: TENX_H5 import requires exactly 1 PRIMARY file, found % (total %)', v_primary_count, v_manifest_file_count;
+    END IF;
+  ELSIF v_import_format = 'TENX_MTX' THEN
+    IF v_matrix_count <> 1 OR v_features_count <> 1 OR v_barcodes_count <> 1 OR v_manifest_file_count <> 3 THEN
+      RAISE EXCEPTION 'CARDINALITY_ERROR: TENX_MTX import requires exactly 1 MATRIX, 1 FEATURES, 1 BARCODES (total 3), found matrix=%, features=%, barcodes=%, total=%',
+        v_matrix_count, v_features_count, v_barcodes_count, v_manifest_file_count;
+    END IF;
+  ELSIF v_import_format = 'GENERIC_MATRIX' THEN
+    IF v_matrix_count <> 1 OR v_cell_meta_count > 1 OR v_feat_meta_count > 1 OR (v_primary_count + v_features_count + v_barcodes_count) > 0 OR v_manifest_file_count <> (v_matrix_count + v_cell_meta_count + v_feat_meta_count) THEN
+      RAISE EXCEPTION 'CARDINALITY_ERROR: GENERIC_MATRIX import requires exactly 1 MATRIX file, at most 1 CELL_METADATA, at most 1 FEATURE_METADATA, and no other roles (found matrix=%, cell_meta=%, feat_meta=%, invalid_roles=%, total=%)',
+        v_matrix_count, v_cell_meta_count, v_feat_meta_count, (v_primary_count + v_features_count + v_barcodes_count), v_manifest_file_count;
+    END IF;
+  ELSE
+    RAISE EXCEPTION 'INVALID_ARGUMENT: unsupported source format %', v_import_format;
+  END IF;
+
+  -- 1:1 physical cryptographic provenance completeness check
   SELECT COUNT(*)
   INTO v_provenance_count
-  FROM dataset_import_files dif
-  JOIN dataset_file_provenance dfp
+  FROM public.dataset_import_files dif
+  JOIN public.dataset_file_provenance dfp
     ON dfp.dataset_file_id = dif.dataset_file_id
    AND dfp.organization_id = dif.organization_id
    AND dfp.dataset_version_id = dif.dataset_version_id
@@ -212,21 +266,43 @@ BEGIN
       v_manifest_file_count, v_provenance_count;
   END IF;
 
-  UPDATE upload_sessions us
+  -- Deterministically lock participating upload sessions in primary key order to prevent deadlocks
+  PERFORM us.id
+  FROM public.upload_sessions us
+  WHERE us.id IN (
+    SELECT dfp.upload_session_id
+    FROM public.dataset_import_files dif
+    JOIN public.dataset_file_provenance dfp
+      ON dfp.dataset_file_id = dif.dataset_file_id
+     AND dfp.organization_id = dif.organization_id
+     AND dfp.dataset_version_id = dif.dataset_version_id
+    WHERE dif.import_id = v_import_id
+      AND dif.organization_id = p_organization_id
+      AND dif.dataset_version_id = p_dataset_version_id
+  )
+  AND us.organization_id = p_organization_id
+  AND us.dataset_version_id = p_dataset_version_id
+  ORDER BY us.id
+  FOR UPDATE;
+
+  -- Exact atomic conditional transition: only participating upload sessions where status = 'VERIFIED'
+  UPDATE public.upload_sessions us
   SET status = 'IMPORTED',
       updated_at = clock_timestamp()
-  FROM dataset_import_files dif
-  JOIN dataset_file_provenance dfp
-    ON dfp.dataset_file_id = dif.dataset_file_id
-   AND dfp.organization_id = dif.organization_id
-   AND dfp.dataset_version_id = dif.dataset_version_id
-  WHERE us.id = dfp.upload_session_id
-    AND us.organization_id = p_organization_id
-    AND us.dataset_version_id = p_dataset_version_id
-    AND dif.import_id = v_import_id
-    AND dif.organization_id = p_organization_id
-    AND dif.dataset_version_id = p_dataset_version_id
-    AND us.status = 'VERIFIED';
+  WHERE us.id IN (
+    SELECT dfp.upload_session_id
+    FROM public.dataset_import_files dif
+    JOIN public.dataset_file_provenance dfp
+      ON dfp.dataset_file_id = dif.dataset_file_id
+     AND dfp.organization_id = dif.organization_id
+     AND dfp.dataset_version_id = dif.dataset_version_id
+    WHERE dif.import_id = v_import_id
+      AND dif.organization_id = p_organization_id
+      AND dif.dataset_version_id = p_dataset_version_id
+  )
+  AND us.organization_id = p_organization_id
+  AND us.dataset_version_id = p_dataset_version_id
+  AND us.status = 'VERIFIED';
 
   GET DIAGNOSTICS v_sessions_updated = ROW_COUNT;
 
@@ -237,7 +313,8 @@ BEGIN
 
   v_finalized_at := clock_timestamp();
 
-  UPDATE dataset_versions
+  -- Atomic update of dataset_versions derived fields where canonical_checksum IS NULL
+  UPDATE public.dataset_versions
   SET canonical_format = 'H5AD',
       canonical_checksum = p_canonical_checksum,
       source_checksum = v_import_source_checksum,
@@ -257,9 +334,10 @@ BEGIN
       p_dataset_version_id;
   END IF;
 
+  -- Audit event ID: strictly prefixed with aud_
   v_audit_id := COALESCE(p_audit_event_id, 'aud_' || gen_random_uuid());
 
-  INSERT INTO audit_events (
+  INSERT INTO public.audit_events (
     id,
     organization_id,
     actor_type,

@@ -1,4 +1,5 @@
 import { eq, and, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import type { TenantContext } from "@/types";
 import { generateDomainId } from "@/lib/id";
 import { getDb, type DbClient } from "../database/client";
@@ -58,18 +59,53 @@ export interface RegisterFileProvenanceInput {
   compression: "NONE" | "GZIP";
 }
 
-export interface ImportFileInput {
+export interface ProvenanceFileDetail {
+  datasetFileId: string;
+  role: ImportFileRole;
+  ordinal: number;
+  sha256: string;
+  compression: "NONE" | "GZIP";
+}
+
+/**
+ * Seam for computing authoritative composite sourceChecksum.
+ * Web NEVER implements independent production hashing algorithms.
+ * In Step C, an injected fixture provider is used for tests.
+ * In Step D, this interface connects to the scientific engine primitive.
+ */
+export interface TrustedChecksumProvider {
+  computeSourceChecksum(
+    sourceFormat: ImportSourceFormat,
+    files: ProvenanceFileDetail[]
+  ): Promise<string> | string;
+}
+
+export interface SubmitImportFileInput {
   datasetFileId: string;
   role: ImportFileRole;
   ordinal: number;
 }
 
-export interface CreateImportManifestInput {
+export type ImportFileInput = SubmitImportFileInput;
+
+/**
+ * Public application submission payload.
+ * Invariant: Public requests CANNOT supply sourceChecksum, sha256,
+ * byteSize, r2Key, or uploadSessionId.
+ */
+export interface SubmitImportManifestInput {
+  context: TenantContext;
+  datasetVersionId: string;
+  sourceFormat: ImportSourceFormat;
+  files: SubmitImportFileInput[];
+}
+
+export interface CreateTrustedImportManifestInput {
   context: TenantContext;
   datasetVersionId: string;
   sourceFormat: ImportSourceFormat;
   sourceChecksum: string;
-  files: ImportFileInput[];
+  files: SubmitImportFileInput[];
 }
 
 export interface FinalizeImportInput {
@@ -94,27 +130,94 @@ export interface FinalizeImportResult {
 
 export interface DatasetImportServiceOptions {
   dbClient?: DbClient;
+  checksumProvider?: TrustedChecksumProvider;
 }
 
 const SHA256_REGEX = /^[0-9a-f]{64}$/;
 
 /**
+ * Validates role distribution and exact cardinality for all supported source formats.
+ */
+function validateRoleCardinality(
+  sourceFormat: ImportSourceFormat,
+  files: SubmitImportFileInput[]
+): void {
+  if (!files || files.length === 0) {
+    throw new ValidationError("Import manifest must contain at least one file");
+  }
+
+  // Duplicate file ID guard
+  const fileIds = new Set<string>();
+  for (const f of files) {
+    if (fileIds.has(f.datasetFileId)) {
+      throw new ValidationError(`Duplicate file ${f.datasetFileId} in import manifest`);
+    }
+    fileIds.add(f.datasetFileId);
+  }
+
+  const roleCounts: Record<ImportFileRole, number> = {
+    PRIMARY: 0,
+    MATRIX: 0,
+    FEATURES: 0,
+    BARCODES: 0,
+    CELL_METADATA: 0,
+    FEATURE_METADATA: 0,
+  };
+
+  for (const f of files) {
+    if (!(f.role in roleCounts)) {
+      throw new ValidationError(`Invalid file role ${f.role} in manifest`);
+    }
+    roleCounts[f.role]++;
+  }
+
+  if (sourceFormat === "H5AD") {
+    if (roleCounts.PRIMARY !== 1 || files.length !== 1) {
+      throw new ValidationError("H5AD import requires exactly 1 file with role PRIMARY");
+    }
+  } else if (sourceFormat === "TENX_H5") {
+    if (roleCounts.PRIMARY !== 1 || files.length !== 1) {
+      throw new ValidationError("TENX_H5 import requires exactly 1 file with role PRIMARY");
+    }
+  } else if (sourceFormat === "TENX_MTX") {
+    if (
+      roleCounts.MATRIX !== 1 ||
+      roleCounts.FEATURES !== 1 ||
+      roleCounts.BARCODES !== 1 ||
+      files.length !== 3
+    ) {
+      throw new ValidationError(
+        "TENX_MTX import requires exactly 3 files: MATRIX, FEATURES, and BARCODES"
+      );
+    }
+  } else if (sourceFormat === "GENERIC_MATRIX") {
+    const invalidRoles = roleCounts.PRIMARY + roleCounts.FEATURES + roleCounts.BARCODES;
+    if (
+      roleCounts.MATRIX !== 1 ||
+      roleCounts.CELL_METADATA > 1 ||
+      roleCounts.FEATURE_METADATA > 1 ||
+      invalidRoles > 0 ||
+      files.length !== roleCounts.MATRIX + roleCounts.CELL_METADATA + roleCounts.FEATURE_METADATA
+    ) {
+      throw new ValidationError(
+        "GENERIC_MATRIX import requires exactly 1 MATRIX file, at most 1 CELL_METADATA, at most 1 FEATURE_METADATA, and no other roles"
+      );
+    }
+  } else {
+    throw new ValidationError(`Unsupported source format: ${sourceFormat}`);
+  }
+}
+
+/**
  * Dataset Import Application Service (Phase 3 Scientific Persistence Boundary)
- *
- * Master Design & Invariants:
- * 1. Scientific Manifest Root: dataset_imports is immutable and references
- *    normalized dataset_import_files.
- * 2. Strict Tenant Scoping: All manifest lookups, file registrations, and finalizations
- *    are scoped by context.organizationId.
- * 3. Exact Role Cardinality: Strictly checks source format member requirements.
- * 4. Stored Procedure Finalization: Uses finalize_dataset_version_import for atomic,
- *    tenant-safe, and idempotent finalization.
  */
 export class DatasetImportService {
   private readonly db: DbClient;
+  private readonly checksumProvider?: TrustedChecksumProvider;
 
   constructor(options: DatasetImportServiceOptions = {}) {
     this.db = options.dbClient ?? getDb();
+    this.checksumProvider = options.checksumProvider;
   }
 
   /**
@@ -154,53 +257,79 @@ export class DatasetImportService {
   }
 
   /**
-   * Atomically creates the immutable dataset import manifest and its file members.
+   * Public manifest submission boundary.
+   * Does NOT accept sourceChecksum, sha256, r2Key, or uploadSessionId from caller.
+   * Looks up physical provenance from database and resolves checksum via TrustedChecksumProvider.
    */
-  async createImportManifest(input: CreateImportManifestInput): Promise<DatasetImportDTO> {
+  async submitImportManifest(input: SubmitImportManifestInput): Promise<DatasetImportDTO> {
+    const orgId = input.context.organizationId;
+
+    // Strict role cardinality validation
+    validateRoleCardinality(input.sourceFormat, input.files);
+
+    // Look up verified physical provenance for each file
+    const fileDetails: ProvenanceFileDetail[] = [];
+
+    for (const f of input.files) {
+      const [provenanceRow] = await this.db
+        .select()
+        .from(datasetFileProvenance)
+        .where(
+          and(
+            eq(datasetFileProvenance.datasetFileId, f.datasetFileId),
+            eq(datasetFileProvenance.organizationId, orgId),
+            eq(datasetFileProvenance.datasetVersionId, input.datasetVersionId)
+          )
+        );
+
+      if (!provenanceRow) {
+        throw new ValidationError(
+          `Missing verified physical provenance for file ${f.datasetFileId}`
+        );
+      }
+
+      fileDetails.push({
+        datasetFileId: f.datasetFileId,
+        role: f.role,
+        ordinal: f.ordinal,
+        sha256: provenanceRow.sha256,
+        compression: provenanceRow.compression as "NONE" | "GZIP",
+      });
+    }
+
+    if (!this.checksumProvider) {
+      throw new ValidationError(
+        "Trusted checksum provider is not configured for manifest creation"
+      );
+    }
+
+    const sourceChecksum = await this.checksumProvider.computeSourceChecksum(
+      input.sourceFormat,
+      fileDetails
+    );
+
+    return this.createTrustedImportManifest({
+      context: input.context,
+      datasetVersionId: input.datasetVersionId,
+      sourceFormat: input.sourceFormat,
+      sourceChecksum,
+      files: input.files,
+    });
+  }
+
+  /**
+   * Trusted import manifest creation path (used by submitImportManifest or trusted service).
+   */
+  async createTrustedImportManifest(
+    input: CreateTrustedImportManifestInput
+  ): Promise<DatasetImportDTO> {
     const orgId = input.context.organizationId;
 
     if (!SHA256_REGEX.test(input.sourceChecksum)) {
       throw new ValidationError("sourceChecksum must be a 64-character lowercase hex string");
     }
 
-    if (!input.files || input.files.length === 0) {
-      throw new ValidationError("Import manifest must contain at least one file");
-    }
-
-    // Role cardinality checks
-    if (input.sourceFormat === "H5AD" || input.sourceFormat === "TENX_H5") {
-      if (input.files.length !== 1 || input.files[0]?.role !== "PRIMARY") {
-        throw new ValidationError(
-          `${input.sourceFormat} import requires exactly 1 file with role PRIMARY`
-        );
-      }
-    } else if (input.sourceFormat === "TENX_MTX") {
-      if (input.files.length !== 3) {
-        throw new ValidationError(
-          "TENX_MTX import requires exactly 3 files: MATRIX, FEATURES, and BARCODES"
-        );
-      }
-      const roles = new Set(input.files.map((f) => f.role));
-      if (!roles.has("MATRIX") || !roles.has("FEATURES") || !roles.has("BARCODES")) {
-        throw new ValidationError("TENX_MTX files must include MATRIX, FEATURES, and BARCODES");
-      }
-    } else if (input.sourceFormat === "GENERIC_MATRIX") {
-      const hasMatrix = input.files.some((f) => f.role === "MATRIX");
-      if (!hasMatrix) {
-        throw new ValidationError(
-          "GENERIC_MATRIX import requires at least 1 file with role MATRIX"
-        );
-      }
-    }
-
-    // Check duplicate files
-    const fileIds = new Set<string>();
-    for (const f of input.files) {
-      if (fileIds.has(f.datasetFileId)) {
-        throw new ValidationError(`Duplicate file ${f.datasetFileId} in import manifest`);
-      }
-      fileIds.add(f.datasetFileId);
-    }
+    validateRoleCardinality(input.sourceFormat, input.files);
 
     const importId = generateDomainId("dim");
 
@@ -328,6 +457,8 @@ export class DatasetImportService {
       throw new ValidationError("cellCount and geneCount must be at least 1");
     }
 
+    const auditEventId = input.auditEventId ?? `aud_${randomUUID()}`;
+
     try {
       const result = await this.db.execute<{
         status: string;
@@ -347,7 +478,7 @@ export class DatasetImportService {
           ${actorId},
           ${input.ipHash ?? null},
           ${input.userAgent ?? null},
-          ${input.auditEventId ?? null}
+          ${auditEventId}
         )`
       );
 

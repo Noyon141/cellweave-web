@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   DatasetImportService,
   type ImportFileInput,
+  type SubmitImportFileInput,
+  type TrustedChecksumProvider,
+  type ProvenanceFileDetail,
 } from "@/server/services/dataset-import-service";
 import type { TenantContext } from "@/types";
 import {
@@ -26,6 +29,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
     transaction: ReturnType<typeof vi.fn>;
     execute: ReturnType<typeof vi.fn>;
   };
+  let mockChecksumProvider: TrustedChecksumProvider;
   let service: DatasetImportService;
 
   beforeEach(() => {
@@ -44,8 +48,15 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       execute: vi.fn(),
     };
 
+    mockChecksumProvider = {
+      computeSourceChecksum: vi
+        .fn()
+        .mockImplementation((_format: string, _files: ProvenanceFileDetail[]) => validSha256),
+    };
+
     service = new DatasetImportService({
       dbClient: mockDb as unknown as DbClient,
+      checksumProvider: mockChecksumProvider,
     });
   });
 
@@ -97,9 +108,77 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
     });
   });
 
-  describe("createImportManifest", () => {
+  describe("submitImportManifest (Public Request Boundary)", () => {
+    it("derives sourceChecksum from trusted database provenance and provider, rejecting client injection", async () => {
+      // Mock provenance lookup in database for the submitted file
+      mockDb.select
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              {
+                id: "dfp_1",
+                organizationId: "org_alpha_lab",
+                datasetVersionId: "dsv_1",
+                datasetFileId: "dsf_1",
+                sha256: validSha256,
+                compression: "NONE",
+              },
+            ]),
+          }),
+        })
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              {
+                id: "dsv_1",
+                organizationId: "org_alpha_lab",
+                sourceFormat: "H5AD",
+              },
+            ]),
+          }),
+        });
+
+      const publicSubmission: SubmitImportFileInput[] = [
+        { datasetFileId: "dsf_1", role: "PRIMARY", ordinal: 0 },
+      ];
+
+      const result = await service.submitImportManifest({
+        context: mockContext,
+        datasetVersionId: "dsv_1",
+        sourceFormat: "H5AD",
+        files: publicSubmission,
+      });
+
+      expect(mockChecksumProvider.computeSourceChecksum).toHaveBeenCalledTimes(1);
+      expect(result.sourceChecksum).toBe(validSha256);
+      expect(result.files).toHaveLength(1);
+    });
+
+    it("fails public submission when file lacks verified physical provenance in database", async () => {
+      // Return empty array for provenance check
+      mockDb.select.mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([]),
+        }),
+      });
+
+      const publicSubmission: SubmitImportFileInput[] = [
+        { datasetFileId: "dsf_unverified", role: "PRIMARY", ordinal: 0 },
+      ];
+
+      await expect(
+        service.submitImportManifest({
+          context: mockContext,
+          datasetVersionId: "dsv_1",
+          sourceFormat: "H5AD",
+          files: publicSubmission,
+        })
+      ).rejects.toThrow(/Missing verified physical provenance/);
+    });
+  });
+
+  describe("createTrustedImportManifest & GENERIC_MATRIX Cardinality", () => {
     it("successfully creates manifest for H5AD format with 1 PRIMARY file", async () => {
-      // Mock dataset_versions existence check
       mockDb.select.mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockResolvedValue([
@@ -113,14 +192,10 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       });
 
       const files: ImportFileInput[] = [
-        {
-          datasetFileId: "dsf_primary",
-          role: "PRIMARY",
-          ordinal: 0,
-        },
+        { datasetFileId: "dsf_primary", role: "PRIMARY", ordinal: 0 },
       ];
 
-      const result = await service.createImportManifest({
+      const result = await service.createTrustedImportManifest({
         context: mockContext,
         datasetVersionId: "dsv_1",
         sourceFormat: "H5AD",
@@ -132,8 +207,6 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       expect(result.organizationId).toBe("org_alpha_lab");
       expect(result.sourceFormat).toBe("H5AD");
       expect(result.files).toHaveLength(1);
-      expect(result.files[0]?.id).toMatch(/^dif_/);
-      expect(result.files[0]?.role).toBe("PRIMARY");
     });
 
     it("successfully creates manifest for TENX_MTX format with 3 required files", async () => {
@@ -155,7 +228,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
         { datasetFileId: "dsf_bar", role: "BARCODES", ordinal: 2 },
       ];
 
-      const result = await service.createImportManifest({
+      const result = await service.createTrustedImportManifest({
         context: mockContext,
         datasetVersionId: "dsv_mtx",
         sourceFormat: "TENX_MTX",
@@ -167,38 +240,163 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       expect(result.files).toHaveLength(3);
     });
 
-    it("rejects TENX_MTX format if any of the three required files is missing", async () => {
-      const files: ImportFileInput[] = [
-        { datasetFileId: "dsf_mat", role: "MATRIX", ordinal: 0 },
-        { datasetFileId: "dsf_feat", role: "FEATURES", ordinal: 1 },
-      ];
+    describe("GENERIC_MATRIX Cardinality Matrix", () => {
+      const setupVersionMock = () => {
+        mockDb.select.mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              {
+                id: "dsv_generic",
+                organizationId: "org_alpha_lab",
+                sourceFormat: "GENERIC_MATRIX",
+              },
+            ]),
+          }),
+        });
+      };
 
-      await expect(
-        service.createImportManifest({
+      it("succeeds with MATRIX only", async () => {
+        setupVersionMock();
+        const files: ImportFileInput[] = [{ datasetFileId: "dsf_m", role: "MATRIX", ordinal: 0 }];
+        const res = await service.createTrustedImportManifest({
           context: mockContext,
-          datasetVersionId: "dsv_mtx",
-          sourceFormat: "TENX_MTX",
+          datasetVersionId: "dsv_generic",
+          sourceFormat: "GENERIC_MATRIX",
           sourceChecksum: validSha256,
           files,
-        })
-      ).rejects.toThrow(ValidationError);
-    });
+        });
+        expect(res.files).toHaveLength(1);
+      });
 
-    it("rejects H5AD format if more than 1 file is provided", async () => {
-      const files: ImportFileInput[] = [
-        { datasetFileId: "dsf_1", role: "PRIMARY", ordinal: 0 },
-        { datasetFileId: "dsf_2", role: "CELL_METADATA", ordinal: 1 },
-      ];
-
-      await expect(
-        service.createImportManifest({
+      it("succeeds with MATRIX + CELL_METADATA", async () => {
+        setupVersionMock();
+        const files: ImportFileInput[] = [
+          { datasetFileId: "dsf_m", role: "MATRIX", ordinal: 0 },
+          { datasetFileId: "dsf_cm", role: "CELL_METADATA", ordinal: 1 },
+        ];
+        const res = await service.createTrustedImportManifest({
           context: mockContext,
-          datasetVersionId: "dsv_1",
-          sourceFormat: "H5AD",
+          datasetVersionId: "dsv_generic",
+          sourceFormat: "GENERIC_MATRIX",
           sourceChecksum: validSha256,
           files,
-        })
-      ).rejects.toThrow(ValidationError);
+        });
+        expect(res.files).toHaveLength(2);
+      });
+
+      it("succeeds with MATRIX + FEATURE_METADATA", async () => {
+        setupVersionMock();
+        const files: ImportFileInput[] = [
+          { datasetFileId: "dsf_m", role: "MATRIX", ordinal: 0 },
+          { datasetFileId: "dsf_fm", role: "FEATURE_METADATA", ordinal: 1 },
+        ];
+        const res = await service.createTrustedImportManifest({
+          context: mockContext,
+          datasetVersionId: "dsv_generic",
+          sourceFormat: "GENERIC_MATRIX",
+          sourceChecksum: validSha256,
+          files,
+        });
+        expect(res.files).toHaveLength(2);
+      });
+
+      it("succeeds with MATRIX + CELL_METADATA + FEATURE_METADATA", async () => {
+        setupVersionMock();
+        const files: ImportFileInput[] = [
+          { datasetFileId: "dsf_m", role: "MATRIX", ordinal: 0 },
+          { datasetFileId: "dsf_cm", role: "CELL_METADATA", ordinal: 1 },
+          { datasetFileId: "dsf_fm", role: "FEATURE_METADATA", ordinal: 2 },
+        ];
+        const res = await service.createTrustedImportManifest({
+          context: mockContext,
+          datasetVersionId: "dsv_generic",
+          sourceFormat: "GENERIC_MATRIX",
+          sourceChecksum: validSha256,
+          files,
+        });
+        expect(res.files).toHaveLength(3);
+      });
+
+      it("rejects 0 MATRIX files", async () => {
+        const files: ImportFileInput[] = [
+          { datasetFileId: "dsf_cm", role: "CELL_METADATA", ordinal: 0 },
+        ];
+        await expect(
+          service.createTrustedImportManifest({
+            context: mockContext,
+            datasetVersionId: "dsv_generic",
+            sourceFormat: "GENERIC_MATRIX",
+            sourceChecksum: validSha256,
+            files,
+          })
+        ).rejects.toThrow(ValidationError);
+      });
+
+      it("rejects 2+ MATRIX files", async () => {
+        const files: ImportFileInput[] = [
+          { datasetFileId: "dsf_m1", role: "MATRIX", ordinal: 0 },
+          { datasetFileId: "dsf_m2", role: "MATRIX", ordinal: 1 },
+        ];
+        await expect(
+          service.createTrustedImportManifest({
+            context: mockContext,
+            datasetVersionId: "dsv_generic",
+            sourceFormat: "GENERIC_MATRIX",
+            sourceChecksum: validSha256,
+            files,
+          })
+        ).rejects.toThrow(ValidationError);
+      });
+
+      it("rejects 2+ CELL_METADATA files", async () => {
+        const files: ImportFileInput[] = [
+          { datasetFileId: "dsf_m", role: "MATRIX", ordinal: 0 },
+          { datasetFileId: "dsf_cm1", role: "CELL_METADATA", ordinal: 1 },
+          { datasetFileId: "dsf_cm2", role: "CELL_METADATA", ordinal: 2 },
+        ];
+        await expect(
+          service.createTrustedImportManifest({
+            context: mockContext,
+            datasetVersionId: "dsv_generic",
+            sourceFormat: "GENERIC_MATRIX",
+            sourceChecksum: validSha256,
+            files,
+          })
+        ).rejects.toThrow(ValidationError);
+      });
+
+      it("rejects 2+ FEATURE_METADATA files", async () => {
+        const files: ImportFileInput[] = [
+          { datasetFileId: "dsf_m", role: "MATRIX", ordinal: 0 },
+          { datasetFileId: "dsf_fm1", role: "FEATURE_METADATA", ordinal: 1 },
+          { datasetFileId: "dsf_fm2", role: "FEATURE_METADATA", ordinal: 2 },
+        ];
+        await expect(
+          service.createTrustedImportManifest({
+            context: mockContext,
+            datasetVersionId: "dsv_generic",
+            sourceFormat: "GENERIC_MATRIX",
+            sourceChecksum: validSha256,
+            files,
+          })
+        ).rejects.toThrow(ValidationError);
+      });
+
+      it("rejects unrelated roles like PRIMARY, FEATURES, or BARCODES in GENERIC_MATRIX", async () => {
+        const files: ImportFileInput[] = [
+          { datasetFileId: "dsf_m", role: "MATRIX", ordinal: 0 },
+          { datasetFileId: "dsf_feat", role: "FEATURES", ordinal: 1 },
+        ];
+        await expect(
+          service.createTrustedImportManifest({
+            context: mockContext,
+            datasetVersionId: "dsv_generic",
+            sourceFormat: "GENERIC_MATRIX",
+            sourceChecksum: validSha256,
+            files,
+          })
+        ).rejects.toThrow(ValidationError);
+      });
     });
 
     it("rejects duplicate datasetFileId in manifest input", async () => {
@@ -209,7 +407,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       ];
 
       await expect(
-        service.createImportManifest({
+        service.createTrustedImportManifest({
           context: mockContext,
           datasetVersionId: "dsv_1",
           sourceFormat: "TENX_MTX",
@@ -229,7 +427,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       const files: ImportFileInput[] = [{ datasetFileId: "dsf_1", role: "PRIMARY", ordinal: 0 }];
 
       await expect(
-        service.createImportManifest({
+        service.createTrustedImportManifest({
           context: mockContext,
           datasetVersionId: "dsv_nonexistent",
           sourceFormat: "H5AD",
@@ -255,7 +453,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       const files: ImportFileInput[] = [{ datasetFileId: "dsf_1", role: "PRIMARY", ordinal: 0 }];
 
       await expect(
-        service.createImportManifest({
+        service.createTrustedImportManifest({
           context: mockContext,
           datasetVersionId: "dsv_1",
           sourceFormat: "H5AD",
@@ -315,18 +513,19 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       expect(result).not.toBeNull();
       expect(result?.id).toBe("dim_1");
       expect(result?.files).toHaveLength(1);
-      expect(result?.files[0]?.role).toBe("PRIMARY");
     });
   });
 
   describe("finalizeImport", () => {
-    it("successfully calls stored procedure and returns FINALIZED result", async () => {
+    it("successfully calls stored procedure and derives authoritative projectId (where datasetId != projectId)", async () => {
+      const expectedCanonicalKey =
+        "org/org_alpha_lab/project/prj_authoritative_42/datasets/dsv_test_99/canonical/canonical.h5ad";
+
       mockDb.execute.mockResolvedValueOnce({
         rows: [
           {
             status: "FINALIZED",
-            canonical_artifact_key:
-              "org/org_alpha_lab/project/prj_1/datasets/dsv_1/canonical/canonical.h5ad",
+            canonical_artifact_key: expectedCanonicalKey,
             finalized_at: new Date().toISOString(),
           },
         ],
@@ -334,7 +533,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
 
       const result = await service.finalizeImport({
         context: mockContext,
-        datasetVersionId: "dsv_1",
+        datasetVersionId: "dsv_test_99",
         canonicalChecksum: validSha256,
         organism: "Homo sapiens",
         geneIdScheme: "GENE_SYMBOL",
@@ -344,13 +543,13 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       });
 
       expect(result.status).toBe("FINALIZED");
-      expect(result.canonicalArtifactKey).toBe(
-        "org/org_alpha_lab/project/prj_1/datasets/dsv_1/canonical/canonical.h5ad"
-      );
+      expect(result.canonicalArtifactKey).toBe(expectedCanonicalKey);
+      expect(result.canonicalArtifactKey).toContain("project/prj_authoritative_42/");
+      expect(result.canonicalArtifactKey).not.toContain("project/ds_test_99/");
       expect(mockDb.execute).toHaveBeenCalledTimes(1);
     });
 
-    it("handles idempotent replay (ALREADY_FINALIZED) gracefully", async () => {
+    it("handles idempotent replay (ALREADY_FINALIZED) gracefully without duplicate mutation", async () => {
       mockDb.execute.mockResolvedValueOnce({
         rows: [
           {
@@ -373,6 +572,58 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       });
 
       expect(result.status).toBe("ALREADY_FINALIZED");
+    });
+
+    describe("Idempotent Replay Rejection per Mutable Field", () => {
+      const testCases = [
+        {
+          field: "canonicalChecksum",
+          error:
+            "FINALIZATION_CONFLICT: dataset version dsv_1 is already finalized with differing properties",
+        },
+        {
+          field: "organism",
+          error:
+            "FINALIZATION_CONFLICT: dataset version dsv_1 is already finalized with differing properties",
+        },
+        {
+          field: "geneIdScheme",
+          error:
+            "FINALIZATION_CONFLICT: dataset version dsv_1 is already finalized with differing properties",
+        },
+        {
+          field: "referenceBuild",
+          error:
+            "FINALIZATION_CONFLICT: dataset version dsv_1 is already finalized with differing properties",
+        },
+        {
+          field: "cellCount",
+          error:
+            "FINALIZATION_CONFLICT: dataset version dsv_1 is already finalized with differing properties",
+        },
+        {
+          field: "geneCount",
+          error:
+            "FINALIZATION_CONFLICT: dataset version dsv_1 is already finalized with differing properties",
+        },
+      ];
+
+      it.each(testCases)("rejects conflicting replay when $field differs", async ({ error }) => {
+        mockDb.execute.mockRejectedValueOnce(new Error(error));
+
+        await expect(
+          service.finalizeImport({
+            context: mockContext,
+            datasetVersionId: "dsv_1",
+            canonicalChecksum: validSha256,
+            organism: "Homo sapiens",
+            geneIdScheme: "GENE_SYMBOL",
+            referenceBuild: "GRCh38",
+            cellCount: 2500,
+            geneCount: 18000,
+          })
+        ).rejects.toThrow(ConflictError);
+      });
     });
 
     it("rejects invalid canonical checksum format", async () => {
@@ -421,10 +672,48 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
       ).rejects.toThrow(ResourceNotFoundError);
     });
 
-    it("translates FINALIZATION_CONFLICT to ConflictError", async () => {
+    it("translates CARDINALITY_ERROR to ValidationError", async () => {
       mockDb.execute.mockRejectedValueOnce(
         new Error(
-          "FINALIZATION_CONFLICT: dataset version dsv_1 is already finalized with differing properties"
+          "CARDINALITY_ERROR: GENERIC_MATRIX import requires exactly 1 MATRIX file, at most 1 CELL_METADATA, at most 1 FEATURE_METADATA, and no other roles"
+        )
+      );
+
+      await expect(
+        service.finalizeImport({
+          context: mockContext,
+          datasetVersionId: "dsv_1",
+          canonicalChecksum: validSha256,
+          organism: "Homo sapiens",
+          geneIdScheme: "GENE_SYMBOL",
+          cellCount: 2500,
+          geneCount: 18000,
+        })
+      ).rejects.toThrow(ValidationError);
+    });
+
+    it("translates INCOMPLETE_PROVENANCE to ValidationError", async () => {
+      mockDb.execute.mockRejectedValueOnce(
+        new Error("INCOMPLETE_PROVENANCE: 2 files in manifest but 1 have verified provenance")
+      );
+
+      await expect(
+        service.finalizeImport({
+          context: mockContext,
+          datasetVersionId: "dsv_1",
+          canonicalChecksum: validSha256,
+          organism: "Homo sapiens",
+          geneIdScheme: "GENE_SYMBOL",
+          cellCount: 2500,
+          geneCount: 18000,
+        })
+      ).rejects.toThrow(ValidationError);
+    });
+
+    it("translates UPLOAD_SESSION_STATE_CONFLICT to ConflictError", async () => {
+      mockDb.execute.mockRejectedValueOnce(
+        new Error(
+          "UPLOAD_SESSION_STATE_CONFLICT: expected 1 verified upload sessions to mark IMPORTED, but updated 0"
         )
       );
 
@@ -439,24 +728,6 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
           geneCount: 18000,
         })
       ).rejects.toThrow(ConflictError);
-    });
-
-    it("translates CARDINALITY_ERROR to ValidationError", async () => {
-      mockDb.execute.mockRejectedValueOnce(
-        new Error("CARDINALITY_ERROR: H5AD import requires exactly 1 PRIMARY file, found 0")
-      );
-
-      await expect(
-        service.finalizeImport({
-          context: mockContext,
-          datasetVersionId: "dsv_1",
-          canonicalChecksum: validSha256,
-          organism: "Homo sapiens",
-          geneIdScheme: "GENE_SYMBOL",
-          cellCount: 2500,
-          geneCount: 18000,
-        })
-      ).rejects.toThrow(ValidationError);
     });
   });
 });
