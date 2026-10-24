@@ -18,6 +18,17 @@ describe("Environment Configuration Strategy", () => {
     expect(result.success).toBe(true);
   });
 
+  it("keeps finalizer credentials optional and separate from the ordinary runtime URL", () => {
+    expect(envSchema.parse(validBaseEnv).IMPORT_FINALIZER_DATABASE_URL).toBeUndefined();
+    const finalizerUrl = "postgresql://cellweave_import_finalizer:test@localhost/finalizer_test";
+    const result = envSchema.parse({
+      ...validBaseEnv,
+      IMPORT_FINALIZER_DATABASE_URL: finalizerUrl,
+    });
+    expect(result.DATABASE_URL).toBe(validBaseEnv.DATABASE_URL);
+    expect(result.IMPORT_FINALIZER_DATABASE_URL).toBe(finalizerUrl);
+  });
+
   it("successfully reads test-injected configuration via getEnv()", () => {
     const config = getEnv();
     expect(config.NODE_ENV).toBe("test");

@@ -15,6 +15,9 @@ export const envSchema = z.object({
     .string()
     .min(1)
     .default("postgresql://postgres:postgres@localhost:5432/cellweave_dev"),
+  // Internal Phase 3 connection only. Validated lazily by the dedicated factory.
+  // Absence must not prevent ordinary web startup or select DATABASE_URL.
+  IMPORT_FINALIZER_DATABASE_URL: z.string().optional(),
 
   // BetterAuth (Strictly required in real DEV/STAGING runtimes; no placeholder fallback defaults)
   BETTER_AUTH_SECRET: z

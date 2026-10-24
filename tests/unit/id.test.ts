@@ -2,7 +2,18 @@ import { describe, it, expect } from "vitest";
 import { generateDomainId, type DomainPrefix } from "@/lib/id";
 
 describe("Domain ID Generator (UUIDv7 Foundation)", () => {
-  const prefixes: DomainPrefix[] = ["exp", "smp", "ds", "dsv", "dsf", "upl", "dfp", "dim", "dif"];
+  const prefixes: DomainPrefix[] = [
+    "exp",
+    "smp",
+    "ds",
+    "dsv",
+    "dsf",
+    "upl",
+    "dfp",
+    "dim",
+    "dif",
+    "aud",
+  ];
 
   it.each(prefixes)("generates correct prefix and UUIDv7 format for %s", (prefix) => {
     const id = generateDomainId(prefix);

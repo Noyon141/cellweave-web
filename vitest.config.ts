@@ -19,6 +19,11 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // Node tests use the server condition; Next enforces the client import boundary.
+      "server-only": path.resolve(
+        __dirname,
+        "node_modules/next/dist/compiled/server-only/empty.js"
+      ),
     },
   },
 });

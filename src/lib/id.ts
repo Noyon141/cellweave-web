@@ -3,7 +3,8 @@ import { v7 as uuidv7 } from "uuid";
 /**
  * Supported Domain Entity Prefixes for Phase 2 & Phase 3
  */
-export type DomainPrefix = "exp" | "smp" | "ds" | "dsv" | "dsf" | "upl" | "dfp" | "dim" | "dif";
+export type DomainPrefix =
+  "exp" | "smp" | "ds" | "dsv" | "dsf" | "upl" | "dfp" | "dim" | "dif" | "aud";
 
 /**
  * Centralized Domain ID Generator
@@ -19,6 +20,7 @@ export type DomainPrefix = "exp" | "smp" | "ds" | "dsv" | "dsf" | "upl" | "dfp" 
  * - dfp: Dataset File Provenance
  * - dim: Dataset Import Manifest
  * - dif: Dataset Import File
+ * - aud: Audit Event
  */
 export function generateDomainId(prefix: DomainPrefix): string {
   return `${prefix}_${uuidv7()}`;

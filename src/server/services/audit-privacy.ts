@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { env } from "../config/env";
-import { ValidationError } from "../authorization";
+import { ValidationError } from "../authorization/errors";
 
 /**
  * Forbidden keys that suggest sensitive scientific, security, or private data.
