@@ -67,6 +67,13 @@ describe("internal finalization import boundaries", () => {
       const content = readFileSync(file, "utf8");
       if (path.basename(file) === "route.ts" || /^\s*["']use (client|server)["']/m.test(content)) {
         const dependencies = reachable(file);
+        // Phase 4 adds only a JWT-protected internal control-plane endpoint.
+        if (file.replaceAll("\\", "/").includes("/api/internal/executions/")) {
+          expect(content).toContain("getServiceTokenVerifier");
+          expect(content).toContain('"execution.finalize"');
+          expect(content.indexOf(".verify(")).toBeLessThan(content.indexOf("new ExecutionService"));
+          continue;
+        }
         expect(dependencies.has(service), file).toBe(false);
         expect(dependencies.has(factory), file).toBe(false);
         if (/^\s*["']use client["']/m.test(content)) {

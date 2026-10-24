@@ -18,6 +18,19 @@ export class TemporalClientService {
 
   async getClient(): Promise<Client> {
     if (!this.client) {
+      if (process.env.CELLWEAVE_ENVIRONMENT !== "local") {
+        if (
+          !process.env.TEMPORAL_ADDRESS ||
+          !process.env.TEMPORAL_NAMESPACE ||
+          !process.env.TEMPORAL_TASK_QUEUE ||
+          (!env.TEMPORAL_API_KEY && !(env.TEMPORAL_CLIENT_CERT && env.TEMPORAL_CLIENT_KEY)) ||
+          env.TEMPORAL_NAMESPACE === "default" ||
+          /localhost|127\.0\.0\.1/.test(env.TEMPORAL_ADDRESS)
+        )
+          throw new Error("Explicit Temporal configuration required");
+      }
+      if (Boolean(env.TEMPORAL_CLIENT_CERT) !== Boolean(env.TEMPORAL_CLIENT_KEY))
+        throw new Error("Incomplete Temporal certificate configuration");
       const tlsConfig = env.TEMPORAL_CLIENT_CERT
         ? {
             clientCertPair: {

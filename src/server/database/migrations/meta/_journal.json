@@ -36,6 +36,13 @@
       "when": 1792400000000,
       "tag": "0004_phase3_import_persistence_and_security",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1792830738098,
+      "tag": "0005_phase4_execution_infrastructure",
+      "breakpoints": true
     }
   ]
 }

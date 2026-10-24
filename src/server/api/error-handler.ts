@@ -96,7 +96,8 @@ export function handleRouteError(error: unknown): NextResponse {
     );
   }
 
-  console.error("Unhandled API Error:", error);
+  // Raw upstream errors can contain JWTs, signed URLs or database credentials.
+  console.error("Unhandled API Error", { code: "INTERNAL_ERROR" });
   return NextResponse.json(
     { error: "INTERNAL_SERVER_ERROR", message: "An unexpected error occurred" },
     { status: 500 }
