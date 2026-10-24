@@ -4,7 +4,7 @@ import {
   type ImportFileInput,
   type SubmitImportFileInput,
   type TrustedChecksumProvider,
-  type ProvenanceFileDetail,
+  type TrustedChecksumInput,
 } from "@/server/services/dataset-import-service";
 import type { TenantContext } from "@/types";
 import {
@@ -51,12 +51,14 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
     mockChecksumProvider = {
       computeSourceChecksum: vi
         .fn()
-        .mockImplementation((_format: string, _files: ProvenanceFileDetail[]) => validSha256),
+        .mockImplementation((_input: TrustedChecksumInput) => validSha256),
     };
 
     service = new DatasetImportService({
-      dbClient: mockDb as unknown as DbClient,
-      checksumProvider: mockChecksumProvider,
+      testDependencies: {
+        dbClient: mockDb as unknown as DbClient,
+        checksumProvider: mockChecksumProvider,
+      },
     });
   });
 
@@ -108,72 +110,50 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
     });
   });
 
-  describe("submitImportManifest (Public Request Boundary)", () => {
-    it("derives sourceChecksum from trusted database provenance and provider, rejecting client injection", async () => {
-      // Mock provenance lookup in database for the submitted file
-      mockDb.select
-        .mockReturnValueOnce({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([
-              {
-                id: "dfp_1",
-                organizationId: "org_alpha_lab",
-                datasetVersionId: "dsv_1",
-                datasetFileId: "dsf_1",
-                sha256: validSha256,
-                compression: "NONE",
-              },
+  describe("submitImportManifest", () => {
+    const version = () =>
+      mockDb.select.mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi
+            .fn()
+            .mockResolvedValue([
+              { id: "dsv_1", organizationId: "org_alpha_lab", sourceFormat: "H5AD" },
             ]),
-          }),
-        })
-        .mockReturnValueOnce({
-          from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([
-              {
-                id: "dsv_1",
-                organizationId: "org_alpha_lab",
-                sourceFormat: "H5AD",
-              },
-            ]),
-          }),
-        });
-
-      const publicSubmission: SubmitImportFileInput[] = [
+        }),
+      });
+    it("delegates to the trusted provider after validating persisted format", async () => {
+      version();
+      const files: SubmitImportFileInput[] = [
         { datasetFileId: "dsf_1", role: "PRIMARY", ordinal: 0 },
       ];
-
       const result = await service.submitImportManifest({
         context: mockContext,
         datasetVersionId: "dsv_1",
         sourceFormat: "H5AD",
-        files: publicSubmission,
+        files,
       });
-
-      expect(mockChecksumProvider.computeSourceChecksum).toHaveBeenCalledTimes(1);
+      expect(mockChecksumProvider.computeSourceChecksum).toHaveBeenCalledExactlyOnceWith({
+        context: mockContext,
+        datasetVersionId: "dsv_1",
+        sourceFormat: "H5AD",
+        files,
+      });
       expect(result.sourceChecksum).toBe(validSha256);
-      expect(result.files).toHaveLength(1);
     });
-
-    it("fails public submission when file lacks verified physical provenance in database", async () => {
-      // Return empty array for provenance check
-      mockDb.select.mockReturnValueOnce({
-        from: vi.fn().mockReturnValue({
-          where: vi.fn().mockResolvedValue([]),
-        }),
-      });
-
-      const publicSubmission: SubmitImportFileInput[] = [
-        { datasetFileId: "dsf_unverified", role: "PRIMARY", ordinal: 0 },
-      ];
-
+    it("fails closed when the trusted provider rejects missing provenance", async () => {
+      version();
+      vi.mocked(mockChecksumProvider.computeSourceChecksum).mockRejectedValueOnce(
+        new ValidationError("Missing verified physical provenance")
+      );
       await expect(
         service.submitImportManifest({
           context: mockContext,
           datasetVersionId: "dsv_1",
           sourceFormat: "H5AD",
-          files: publicSubmission,
+          files: [{ datasetFileId: "dsf_1", role: "PRIMARY", ordinal: 0 }],
         })
       ).rejects.toThrow(/Missing verified physical provenance/);
+      expect(mockDb.insert).not.toHaveBeenCalled();
     });
   });
 
@@ -199,7 +179,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
         context: mockContext,
         datasetVersionId: "dsv_1",
         sourceFormat: "H5AD",
-        sourceChecksum: validSha256,
+
         files,
       });
 
@@ -232,7 +212,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
         context: mockContext,
         datasetVersionId: "dsv_mtx",
         sourceFormat: "TENX_MTX",
-        sourceChecksum: validSha256,
+
         files,
       });
 
@@ -262,7 +242,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
           context: mockContext,
           datasetVersionId: "dsv_generic",
           sourceFormat: "GENERIC_MATRIX",
-          sourceChecksum: validSha256,
+
           files,
         });
         expect(res.files).toHaveLength(1);
@@ -278,7 +258,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
           context: mockContext,
           datasetVersionId: "dsv_generic",
           sourceFormat: "GENERIC_MATRIX",
-          sourceChecksum: validSha256,
+
           files,
         });
         expect(res.files).toHaveLength(2);
@@ -294,7 +274,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
           context: mockContext,
           datasetVersionId: "dsv_generic",
           sourceFormat: "GENERIC_MATRIX",
-          sourceChecksum: validSha256,
+
           files,
         });
         expect(res.files).toHaveLength(2);
@@ -311,7 +291,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
           context: mockContext,
           datasetVersionId: "dsv_generic",
           sourceFormat: "GENERIC_MATRIX",
-          sourceChecksum: validSha256,
+
           files,
         });
         expect(res.files).toHaveLength(3);
@@ -326,7 +306,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
             context: mockContext,
             datasetVersionId: "dsv_generic",
             sourceFormat: "GENERIC_MATRIX",
-            sourceChecksum: validSha256,
+
             files,
           })
         ).rejects.toThrow(ValidationError);
@@ -342,7 +322,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
             context: mockContext,
             datasetVersionId: "dsv_generic",
             sourceFormat: "GENERIC_MATRIX",
-            sourceChecksum: validSha256,
+
             files,
           })
         ).rejects.toThrow(ValidationError);
@@ -359,7 +339,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
             context: mockContext,
             datasetVersionId: "dsv_generic",
             sourceFormat: "GENERIC_MATRIX",
-            sourceChecksum: validSha256,
+
             files,
           })
         ).rejects.toThrow(ValidationError);
@@ -376,7 +356,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
             context: mockContext,
             datasetVersionId: "dsv_generic",
             sourceFormat: "GENERIC_MATRIX",
-            sourceChecksum: validSha256,
+
             files,
           })
         ).rejects.toThrow(ValidationError);
@@ -392,7 +372,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
             context: mockContext,
             datasetVersionId: "dsv_generic",
             sourceFormat: "GENERIC_MATRIX",
-            sourceChecksum: validSha256,
+
             files,
           })
         ).rejects.toThrow(ValidationError);
@@ -411,7 +391,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
           context: mockContext,
           datasetVersionId: "dsv_1",
           sourceFormat: "TENX_MTX",
-          sourceChecksum: validSha256,
+
           files,
         })
       ).rejects.toThrow(ValidationError);
@@ -431,7 +411,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
           context: mockContext,
           datasetVersionId: "dsv_nonexistent",
           sourceFormat: "H5AD",
-          sourceChecksum: validSha256,
+
           files,
         })
       ).rejects.toThrow(ResourceNotFoundError);
@@ -457,7 +437,7 @@ describe("DatasetImportService (Phase 3 Persistence Boundary)", () => {
           context: mockContext,
           datasetVersionId: "dsv_1",
           sourceFormat: "H5AD",
-          sourceChecksum: validSha256,
+
           files,
         })
       ).rejects.toThrow(ValidationError);

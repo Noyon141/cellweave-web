@@ -70,7 +70,8 @@ export const createDatasetVersionSchema = z.object({
   referenceBuild: z.string().trim().max(50).nullable().optional(),
   cellCount: z.number().int().nonnegative().nullable().optional(),
   geneCount: z.number().int().nonnegative().nullable().optional(),
-  sourceChecksum: z.string().trim().max(128).nullable().optional(),
+  // Source checksum is established from persisted provenance by Phase 3, never by browser input.
+  sourceChecksum: z.never().optional(),
   canonicalChecksum: z.string().trim().max(128).nullable().optional(),
 });
 
@@ -364,7 +365,7 @@ export class DatasetService {
             referenceBuild: parsed.data.referenceBuild ?? null,
             cellCount: parsed.data.cellCount ?? null,
             geneCount: parsed.data.geneCount ?? null,
-            sourceChecksum: parsed.data.sourceChecksum ?? null,
+            sourceChecksum: null,
             canonicalChecksum: parsed.data.canonicalChecksum ?? null,
             createdAt: now,
           })

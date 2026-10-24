@@ -1,3 +1,4 @@
+import "server-only";
 import { eq, and, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import type { TenantContext } from "@/types";
@@ -11,10 +12,23 @@ import {
 import { datasetVersions } from "../database/schema/datasets";
 import { ConflictError, ResourceNotFoundError, ValidationError } from "../authorization/errors";
 
-export type ImportSourceFormat = "H5AD" | "TENX_H5" | "TENX_MTX" | "GENERIC_MATRIX";
-
-export type ImportFileRole =
-  "PRIMARY" | "MATRIX" | "FEATURES" | "BARCODES" | "CELL_METADATA" | "FEATURE_METADATA";
+import { z } from "zod";
+import { ORGANIZATION_ROLES } from "@/types";
+import { getImportFinalizerDb } from "../database/import-finalizer-client";
+import {
+  PersistedSourceChecksumProvider,
+  type TrustedChecksumProvider,
+} from "./persisted-source-checksum-provider";
+import {
+  validateRoleCardinality,
+  type ImportSourceFormat,
+  type ImportFileRole,
+} from "./source-import-policy";
+export type { ImportSourceFormat, ImportFileRole } from "./source-import-policy";
+export type {
+  TrustedChecksumProvider,
+  TrustedChecksumInput,
+} from "./persisted-source-checksum-provider";
 
 export interface DatasetFileProvenanceDTO {
   id: string;
@@ -59,27 +73,6 @@ export interface RegisterFileProvenanceInput {
   compression: "NONE" | "GZIP";
 }
 
-export interface ProvenanceFileDetail {
-  datasetFileId: string;
-  role: ImportFileRole;
-  ordinal: number;
-  sha256: string;
-  compression: "NONE" | "GZIP";
-}
-
-/**
- * Seam for computing authoritative composite sourceChecksum.
- * Web NEVER implements independent production hashing algorithms.
- * In Step C, an injected fixture provider is used for tests.
- * In Step D, this interface connects to the scientific engine primitive.
- */
-export interface TrustedChecksumProvider {
-  computeSourceChecksum(
-    sourceFormat: ImportSourceFormat,
-    files: ProvenanceFileDetail[]
-  ): Promise<string> | string;
-}
-
 export interface SubmitImportFileInput {
   datasetFileId: string;
   role: ImportFileRole;
@@ -100,13 +93,8 @@ export interface SubmitImportManifestInput {
   files: SubmitImportFileInput[];
 }
 
-export interface CreateTrustedImportManifestInput {
-  context: TenantContext;
-  datasetVersionId: string;
-  sourceFormat: ImportSourceFormat;
-  sourceChecksum: string;
-  files: SubmitImportFileInput[];
-}
+/** Compatibility method name only; no caller-supplied checksum is accepted. */
+export type CreateTrustedImportManifestInput = SubmitImportManifestInput;
 
 export interface FinalizeImportInput {
   context: TenantContext;
@@ -129,95 +117,59 @@ export interface FinalizeImportResult {
 }
 
 export interface DatasetImportServiceOptions {
-  dbClient?: DbClient;
-  checksumProvider?: TrustedChecksumProvider;
+  /** Explicit isolation seam for tests. Production construction supplies no testDependencies. */
+  testDependencies?: { dbClient: DbClient; checksumProvider?: TrustedChecksumProvider };
 }
+
+const sourceFormatSchema = z.enum(["H5AD", "TENX_H5", "TENX_MTX", "GENERIC_MATRIX"]);
+const submissionSchema = z
+  .object({
+    context: z
+      .object({
+        organizationId: z.string().min(1),
+        userId: z.string().min(1),
+        role: z.enum(ORGANIZATION_ROLES),
+      })
+      .strict(),
+    datasetVersionId: z.string().min(1),
+    sourceFormat: sourceFormatSchema,
+    files: z
+      .array(
+        z
+          .object({
+            datasetFileId: z.string().min(1),
+            role: z.enum([
+              "PRIMARY",
+              "MATRIX",
+              "FEATURES",
+              "BARCODES",
+              "CELL_METADATA",
+              "FEATURE_METADATA",
+            ]),
+            ordinal: z.number().int().nonnegative().max(2147483647),
+          })
+          .strict()
+      )
+      .min(1),
+  })
+  .strict();
 
 const SHA256_REGEX = /^[0-9a-f]{64}$/;
-
-/**
- * Validates role distribution and exact cardinality for all supported source formats.
- */
-function validateRoleCardinality(
-  sourceFormat: ImportSourceFormat,
-  files: SubmitImportFileInput[]
-): void {
-  if (!files || files.length === 0) {
-    throw new ValidationError("Import manifest must contain at least one file");
-  }
-
-  // Duplicate file ID guard
-  const fileIds = new Set<string>();
-  for (const f of files) {
-    if (fileIds.has(f.datasetFileId)) {
-      throw new ValidationError(`Duplicate file ${f.datasetFileId} in import manifest`);
-    }
-    fileIds.add(f.datasetFileId);
-  }
-
-  const roleCounts: Record<ImportFileRole, number> = {
-    PRIMARY: 0,
-    MATRIX: 0,
-    FEATURES: 0,
-    BARCODES: 0,
-    CELL_METADATA: 0,
-    FEATURE_METADATA: 0,
-  };
-
-  for (const f of files) {
-    if (!(f.role in roleCounts)) {
-      throw new ValidationError(`Invalid file role ${f.role} in manifest`);
-    }
-    roleCounts[f.role]++;
-  }
-
-  if (sourceFormat === "H5AD") {
-    if (roleCounts.PRIMARY !== 1 || files.length !== 1) {
-      throw new ValidationError("H5AD import requires exactly 1 file with role PRIMARY");
-    }
-  } else if (sourceFormat === "TENX_H5") {
-    if (roleCounts.PRIMARY !== 1 || files.length !== 1) {
-      throw new ValidationError("TENX_H5 import requires exactly 1 file with role PRIMARY");
-    }
-  } else if (sourceFormat === "TENX_MTX") {
-    if (
-      roleCounts.MATRIX !== 1 ||
-      roleCounts.FEATURES !== 1 ||
-      roleCounts.BARCODES !== 1 ||
-      files.length !== 3
-    ) {
-      throw new ValidationError(
-        "TENX_MTX import requires exactly 3 files: MATRIX, FEATURES, and BARCODES"
-      );
-    }
-  } else if (sourceFormat === "GENERIC_MATRIX") {
-    const invalidRoles = roleCounts.PRIMARY + roleCounts.FEATURES + roleCounts.BARCODES;
-    if (
-      roleCounts.MATRIX !== 1 ||
-      roleCounts.CELL_METADATA > 1 ||
-      roleCounts.FEATURE_METADATA > 1 ||
-      invalidRoles > 0 ||
-      files.length !== roleCounts.MATRIX + roleCounts.CELL_METADATA + roleCounts.FEATURE_METADATA
-    ) {
-      throw new ValidationError(
-        "GENERIC_MATRIX import requires exactly 1 MATRIX file, at most 1 CELL_METADATA, at most 1 FEATURE_METADATA, and no other roles"
-      );
-    }
-  } else {
-    throw new ValidationError(`Unsupported source format: ${sourceFormat}`);
-  }
-}
 
 /**
  * Dataset Import Application Service (Phase 3 Scientific Persistence Boundary)
  */
 export class DatasetImportService {
   private readonly db: DbClient;
-  private readonly checksumProvider?: TrustedChecksumProvider;
+  private readonly checksumProvider: TrustedChecksumProvider;
+  private readonly getImportDb: () => Promise<DbClient>;
 
   constructor(options: DatasetImportServiceOptions = {}) {
-    this.db = options.dbClient ?? getDb();
-    this.checksumProvider = options.checksumProvider;
+    this.db = options.testDependencies?.dbClient ?? getDb();
+    this.checksumProvider =
+      options.testDependencies?.checksumProvider ?? new PersistedSourceChecksumProvider(this.db);
+    const testDb = options.testDependencies?.dbClient;
+    this.getImportDb = testDb ? async () => testDb : getImportFinalizerDb;
   }
 
   /**
@@ -228,7 +180,7 @@ export class DatasetImportService {
   ): Promise<DatasetFileProvenanceDTO> {
     const orgId = input.context.organizationId;
 
-    if (!SHA256_REGEX.test(input.sha256)) {
+    if (input.sha256.length !== 64 || !SHA256_REGEX.test(input.sha256)) {
       throw new ValidationError("sha256 must be a 64-character lowercase hex string");
     }
 
@@ -248,7 +200,8 @@ export class DatasetImportService {
       compression: input.compression,
     };
 
-    await this.db.insert(datasetFileProvenance).values(record);
+    const importDb = await this.getImportDb();
+    await importDb.insert(datasetFileProvenance).values(record);
 
     return {
       ...record,
@@ -262,130 +215,72 @@ export class DatasetImportService {
    * Looks up physical provenance from database and resolves checksum via TrustedChecksumProvider.
    */
   async submitImportManifest(input: SubmitImportManifestInput): Promise<DatasetImportDTO> {
-    const orgId = input.context.organizationId;
+    // Snapshot and validate before any await: no checksum/fact overrides or mutable membership.
+    const parsed = submissionSchema.safeParse(input);
+    if (!parsed.success) throw new ValidationError("Invalid import manifest submission");
+    const candidate = parsed.data;
+    validateRoleCardinality(candidate.sourceFormat, candidate.files);
+    const orgId = candidate.context.organizationId;
+    const importDb = await this.getImportDb();
 
-    // Strict role cardinality validation
-    validateRoleCardinality(input.sourceFormat, input.files);
-
-    // Look up verified physical provenance for each file
-    const fileDetails: ProvenanceFileDetail[] = [];
-
-    for (const f of input.files) {
-      const [provenanceRow] = await this.db
-        .select()
-        .from(datasetFileProvenance)
-        .where(
-          and(
-            eq(datasetFileProvenance.datasetFileId, f.datasetFileId),
-            eq(datasetFileProvenance.organizationId, orgId),
-            eq(datasetFileProvenance.datasetVersionId, input.datasetVersionId)
-          )
-        );
-
-      if (!provenanceRow) {
-        throw new ValidationError(
-          `Missing verified physical provenance for file ${f.datasetFileId}`
-        );
-      }
-
-      fileDetails.push({
-        datasetFileId: f.datasetFileId,
-        role: f.role,
-        ordinal: f.ordinal,
-        sha256: provenanceRow.sha256,
-        compression: provenanceRow.compression as "NONE" | "GZIP",
-      });
-    }
-
-    if (!this.checksumProvider) {
-      throw new ValidationError(
-        "Trusted checksum provider is not configured for manifest creation"
-      );
-    }
-
-    const sourceChecksum = await this.checksumProvider.computeSourceChecksum(
-      input.sourceFormat,
-      fileDetails
-    );
-
-    return this.createTrustedImportManifest({
-      context: input.context,
-      datasetVersionId: input.datasetVersionId,
-      sourceFormat: input.sourceFormat,
-      sourceChecksum,
-      files: input.files,
-    });
-  }
-
-  /**
-   * Trusted import manifest creation path (used by submitImportManifest or trusted service).
-   */
-  async createTrustedImportManifest(
-    input: CreateTrustedImportManifestInput
-  ): Promise<DatasetImportDTO> {
-    const orgId = input.context.organizationId;
-
-    if (!SHA256_REGEX.test(input.sourceChecksum)) {
-      throw new ValidationError("sourceChecksum must be a 64-character lowercase hex string");
-    }
-
-    validateRoleCardinality(input.sourceFormat, input.files);
-
-    const importId = generateDomainId("dim");
-
-    return await this.db.transaction(async (tx) => {
-      // Verify version exists and belongs to this org
-      const [versionRecord] = await tx
+    return importDb.transaction(async (tx) => {
+      // Ordinary runtime reads; import writer has no need for broad source-table privileges.
+      const [versionRecord] = await this.db
         .select()
         .from(datasetVersions)
         .where(
           and(
-            eq(datasetVersions.id, input.datasetVersionId),
+            eq(datasetVersions.id, candidate.datasetVersionId),
             eq(datasetVersions.organizationId, orgId)
           )
         );
-
-      if (!versionRecord) {
-        throw new ResourceNotFoundError(
-          `Dataset version ${input.datasetVersionId} not found in active organization`
-        );
+      if (!versionRecord)
+        throw new ResourceNotFoundError("Dataset version unavailable in active organization");
+      const format = sourceFormatSchema.safeParse(versionRecord.sourceFormat);
+      if (!format.success || format.data !== candidate.sourceFormat) {
+        throw new ValidationError("Import source format does not match persisted dataset version");
       }
-
-      if (versionRecord.sourceFormat !== input.sourceFormat) {
-        throw new ValidationError(
-          `Dataset version source format ${versionRecord.sourceFormat} does not match import manifest format ${input.sourceFormat}`
-        );
+      const sourceChecksum = await this.checksumProvider.computeSourceChecksum({
+        context: candidate.context,
+        datasetVersionId: candidate.datasetVersionId,
+        sourceFormat: format.data,
+        files: candidate.files,
+      });
+      if (
+        typeof sourceChecksum !== "string" ||
+        sourceChecksum.length !== 64 ||
+        !SHA256_REGEX.test(sourceChecksum)
+      ) {
+        throw new ValidationError("Invalid trusted source checksum result");
       }
-
       const importRecord = {
-        id: importId,
+        id: generateDomainId("dim"),
         organizationId: orgId,
-        datasetVersionId: input.datasetVersionId,
-        sourceFormat: input.sourceFormat,
-        sourceChecksum: input.sourceChecksum,
+        datasetVersionId: candidate.datasetVersionId,
+        sourceFormat: format.data,
+        sourceChecksum,
       };
-
       await tx.insert(datasetImports).values(importRecord);
-
-      const fileRecords: DatasetImportFileDTO[] = input.files.map((file) => ({
+      const fileRecords: DatasetImportFileDTO[] = candidate.files.map((file) => ({
         id: generateDomainId("dif"),
         organizationId: orgId,
-        datasetVersionId: input.datasetVersionId,
-        importId,
+        datasetVersionId: candidate.datasetVersionId,
+        importId: importRecord.id,
         datasetFileId: file.datasetFileId,
         role: file.role,
         ordinal: file.ordinal,
         createdAt: new Date(),
       }));
-
       await tx.insert(datasetImportFiles).values(fileRecords);
-
-      return {
-        ...importRecord,
-        createdAt: new Date(),
-        files: fileRecords,
-      };
+      return { ...importRecord, createdAt: new Date(), files: fileRecords };
     });
+  }
+
+  /** Compatibility entry point delegates to the same computed-checksum authority. */
+  async createTrustedImportManifest(
+    input: CreateTrustedImportManifestInput
+  ): Promise<DatasetImportDTO> {
+    return this.submitImportManifest(input);
   }
 
   /**
