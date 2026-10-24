@@ -4,7 +4,20 @@ import { v7 as uuidv7 } from "uuid";
  * Supported Domain Entity Prefixes for Phase 2 & Phase 3
  */
 export type DomainPrefix =
-  "exp" | "smp" | "ds" | "dsv" | "dsf" | "upl" | "dfp" | "dim" | "dif" | "aud" | "run" | "wfs";
+  | "exp"
+  | "smp"
+  | "ds"
+  | "dsv"
+  | "dsf"
+  | "upl"
+  | "dfp"
+  | "dim"
+  | "dif"
+  | "aud"
+  | "run"
+  | "wfs"
+  | "art"
+  | "qcd";
 
 /**
  * Centralized Domain ID Generator

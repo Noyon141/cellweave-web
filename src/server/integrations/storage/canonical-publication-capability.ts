@@ -1,3 +1,4 @@
+import { assertConditionalPutSignedHeaders } from "./conditional-signed-headers";
 import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import type { CanonicalArtifactPublicationCapabilities } from "@cellweave/contracts";
@@ -60,37 +61,7 @@ export function redactCapabilityUrl(rawUrl: string): string {
  * inside `X-Amz-SignedHeaders` so a caller cannot strip `If-None-Match: *` and convert
  * the capability into an unconditional overwrite.
  */
-export function assertConditionalPutSignedHeaders(putUrl: string): void {
-  let parsed: URL;
-  try {
-    parsed = new URL(putUrl);
-  } catch (error) {
-    throw new StorageError(
-      "Presigner returned an invalid PUT capability URL",
-      "PROVIDER_ERROR",
-      false,
-      error
-    );
-  }
-
-  const signedHeadersRaw =
-    parsed.searchParams.get("X-Amz-SignedHeaders") ??
-    parsed.searchParams.get("x-amz-signedheaders") ??
-    "";
-
-  const signedHeaders = signedHeadersRaw
-    .split(";")
-    .map((h) => h.trim().toLowerCase())
-    .filter((h) => h.length > 0);
-
-  if (!signedHeaders.includes("if-none-match") || !signedHeaders.includes("content-type")) {
-    throw new StorageError(
-      "Presigned PUT capability did not cryptographically bind required conditional headers (if-none-match, content-type)",
-      "PROVIDER_ERROR",
-      false
-    );
-  }
-}
+export { assertConditionalPutSignedHeaders } from "./conditional-signed-headers";
 
 /**
  * Issues narrowly scoped, short-lived conditional PUT and GET capabilities for a single

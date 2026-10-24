@@ -330,7 +330,13 @@ export class ExecutionService {
           eq(projects.organizationId, analysisRuns.organizationId)
         )
       )
-      .where(and(eq(analysisRuns.id, runId), eq(analysisRuns.executorSubject, executor.subject)));
+      .where(
+        and(
+          eq(analysisRuns.id, runId),
+          eq(analysisRuns.executorSubject, executor.subject),
+          eq(analysisRuns.kind, "IMPORT")
+        )
+      );
     if (!record || record.projectId !== record.run.projectId)
       throw new ResourceNotFoundError("Execution unavailable");
     return record;
@@ -405,7 +411,8 @@ export class ExecutionService {
       .where(
         and(
           notInArray(analysisRuns.status, ["SUCCEEDED", "FAILED", "CANCELLED"]),
-          eq(analysisRuns.executorSubject, executor.subject)
+          eq(analysisRuns.executorSubject, executor.subject),
+          eq(analysisRuns.kind, "IMPORT")
         )
       )
       .orderBy(asc(analysisRuns.updatedAt))
@@ -674,7 +681,11 @@ export class ExecutionService {
       .select()
       .from(analysisRuns)
       .where(
-        and(eq(analysisRuns.id, runId), eq(analysisRuns.organizationId, context.organizationId))
+        and(
+          eq(analysisRuns.id, runId),
+          eq(analysisRuns.organizationId, context.organizationId),
+          eq(analysisRuns.kind, "IMPORT")
+        )
       );
     if (!record) throw new ResourceNotFoundError("Execution unavailable");
     if (context.role === "viewer") throw new TenantAuthorizationError();

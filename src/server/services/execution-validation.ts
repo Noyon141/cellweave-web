@@ -10,7 +10,7 @@ import type {
   ExecutionProjection,
   MetadataMappingSubmission,
 } from "@cellweave/contracts";
-const ajv = new Ajv2020({ strict: false, allErrors: false });
+const ajv = new Ajv2020({ strict: false, strictNumbers: true, allErrors: false });
 addFormats(ajv);
 for (const schema of EXECUTION_JSON_SCHEMAS) ajv.addSchema(schema);
 const root = "https://contracts.cellweave.dev/schemas/jobs/workflow-execution.v1.json#/$defs/";
@@ -26,3 +26,38 @@ export const validMapping = ajv.compile<MetadataMappingSubmission>({
 });
 
 export const validControl = ajv.compile<ExecutionControl>({ $ref: root + "ExecutionControl" });
+
+import type {
+  QcStartRequest,
+  QcSelectionParameters,
+  QcApprovalRequest,
+  QcPreparedExecution,
+  QcJobResult,
+  QcControl,
+  QcDecision,
+  QcProjection,
+  QcApprovalSignal,
+} from "@cellweave/contracts";
+
+const qcRoot = "https://contracts.cellweave.dev/schemas/jobs/qc-execution.v1.json#/$defs/";
+export const validQcStartRequest = ajv.compile<QcStartRequest>({ $ref: qcRoot + "QcStartRequest" });
+export const validQcSelectionParameters = ajv.compile<QcSelectionParameters>({
+  $ref: qcRoot + "QcSelectionParameters",
+});
+export const validQcApprovalRequest = ajv.compile<QcApprovalRequest>({
+  $ref: qcRoot + "QcApprovalRequest",
+});
+export const validQcPreparedExecution = ajv.compile<QcPreparedExecution>({
+  $ref: qcRoot + "QcPreparedExecution",
+});
+export const validQcJobResult = ajv.compile<QcJobResult>({ $ref: qcRoot + "QcJobResult" });
+export const validQcControl = ajv.compile<QcControl>({ $ref: qcRoot + "QcControl" });
+export const validQcDecision = ajv.compile<QcDecision>({ $ref: qcRoot + "QcDecision" });
+export const validQcProjection = ajv.compile<QcProjection>({ $ref: qcRoot + "QcProjection" });
+export const validQcApprovalSignal = ajv.compile<QcApprovalSignal>({
+  $ref: qcRoot + "QcApprovalSignal",
+});
+
+import type { QcReviewView, QcInputOptions } from "@cellweave/contracts";
+export const validQcReviewView = ajv.compile<QcReviewView>({ $ref: qcRoot + "QcReviewView" });
+export const validQcInputOptions = ajv.compile<QcInputOptions>({ $ref: qcRoot + "QcInputOptions" });

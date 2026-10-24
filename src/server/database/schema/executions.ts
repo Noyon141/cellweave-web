@@ -11,6 +11,8 @@ import {
 } from "drizzle-orm/pg-core";
 import type {
   ExecutionEnvelope,
+  QcStepContext,
+  QcJobResult,
   ExecutionResult,
   RunState,
   WorkflowStepState,
@@ -26,6 +28,7 @@ export const analysisRuns = pgTable(
     organizationId: text("organization_id").notNull(),
     projectId: text("project_id").notNull(),
     datasetVersionId: text("dataset_version_id").notNull(),
+    kind: text("kind").$type<"IMPORT" | "QC">().notNull().default("IMPORT"),
     pipelineVersion: text("pipeline_version").notNull(),
     actorId: text("actor_id").notNull(),
     requestKey: text("request_key").notNull(),
@@ -68,6 +71,8 @@ export const workflowSteps = pgTable(
     attempt: integer("attempt").notNull().default(0),
     finalizationStarted: boolean("finalization_started").notNull().default(false),
     result: jsonb("result").$type<ExecutionResult>(),
+    qcContext: jsonb("qc_context").$type<QcStepContext>(),
+    qcResult: jsonb("qc_result").$type<QcJobResult>(),
     provenance: jsonb("provenance").$type<Record<string, unknown>>().notNull().default({}),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -76,6 +81,7 @@ export const workflowSteps = pgTable(
       columns: [t.analysisRunId, t.organizationId],
       foreignColumns: [analysisRuns.id, analysisRuns.organizationId],
     }).onDelete("cascade"),
+    unique("workflow_steps_id_org_run_unique").on(t.id, t.organizationId, t.analysisRunId),
     unique("workflow_steps_run_key_unique").on(t.analysisRunId, t.stepKey),
   ]
 );

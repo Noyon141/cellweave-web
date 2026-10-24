@@ -429,13 +429,14 @@ describe("Database Schema & Tenant Isolation Invariant Validation", () => {
         "src/server/database/migrations/meta/_journal.json"
       );
       const journal = JSON.parse(fs.readFileSync(journalPath, "utf-8"));
-      expect(journal.entries).toHaveLength(6);
+      expect(journal.entries).toHaveLength(7);
       expect(journal.entries[0].tag).toBe("0000_phase1_identity_and_tenancy");
       expect(journal.entries[1].tag).toBe("0001_member_organization_user_unique");
       expect(journal.entries[2].tag).toBe("0002_phase2_projects_and_datasets");
       expect(journal.entries[3].tag).toBe("0003_phase2_upload_identity_hardening");
       expect(journal.entries[4].tag).toBe("0004_phase3_import_persistence_and_security");
       expect(journal.entries[5].tag).toBe("0005_phase4_execution_infrastructure");
+      expect(journal.entries[6].tag).toBe("0006_phase5_qc_review_and_artifacts");
     });
   });
 

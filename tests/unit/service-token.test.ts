@@ -57,13 +57,20 @@ describe("service JWT trust boundary", () => {
     { scope: [] },
     { scope: ["execution.finalize"] },
     { scope: ["admin"] },
-    { exp: now() + 901 },
     { iat: now() + 120, exp: now() + 420 },
     { jti: "" },
     { organizationId: "foreign-tenant" },
   ])("rejects invalid or excessive claims %j", async (overrides) => {
     await expect(
       verify.verify(`Bearer ${await token(overrides)}`, ["execution.project"])
+    ).rejects.toThrow("Service authentication failed");
+  });
+  it("rejects a lifetime above 15 minutes without a module-load clock race", async () => {
+    const issued = now();
+    await expect(
+      verify.verify(`Bearer ${await token({ iat: issued, exp: issued + 901 })}`, [
+        "execution.project",
+      ])
     ).rejects.toThrow("Service authentication failed");
   });
   it.each(["iss", "sub", "aud", "iat", "exp", "jti", "scope"])("requires %s", async (claim) => {
