@@ -437,6 +437,7 @@ describe("Phase 2 Application Services Unit Tests", () => {
         recordUserAuditEvent: vi.fn().mockResolvedValue({}),
       };
 
+      const persistedValues = vi.fn();
       const mockDb = {
         transaction: async (cb: (tx: unknown) => Promise<unknown>) => cb(mockDb),
         select: () => ({
@@ -461,15 +462,18 @@ describe("Phase 2 Application Services Unit Tests", () => {
           }),
         }),
         insert: () => ({
-          values: (vals: Record<string, unknown>) => ({
-            returning: () =>
-              Promise.resolve([
-                {
-                  ...vals,
-                  createdAt: new Date(),
-                },
-              ]),
-          }),
+          values: (vals: Record<string, unknown>) => {
+            persistedValues(vals);
+            return {
+              returning: () =>
+                Promise.resolve([
+                  {
+                    ...vals,
+                    createdAt: new Date(),
+                  },
+                ]),
+            };
+          },
         }),
       } as unknown as DbClient;
 
@@ -518,12 +522,33 @@ describe("Phase 2 Application Services Unit Tests", () => {
       const ctx = makeContext("scientist");
       const dsv = await service.createDatasetVersion(ctx, "ds_1", {
         sourceFormat: "10x_h5",
-        organism: "Mus musculus",
       });
 
       expect(dsv.id).toMatch(/^dsv_[0-9a-f-]+/);
       expect(dsv.versionNumber).toBe(1);
       expect(dsv.sourceFormat).toBe("10x_h5");
+      expect(dsv).toMatchObject({
+        sourceChecksum: null,
+        canonicalChecksum: null,
+        canonicalFormat: null,
+        organism: null,
+        geneIdScheme: null,
+        referenceBuild: null,
+        cellCount: null,
+        geneCount: null,
+      });
+      expect(persistedValues).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          sourceChecksum: null,
+          canonicalChecksum: null,
+          canonicalFormat: null,
+          organism: null,
+          geneIdScheme: null,
+          referenceBuild: null,
+          cellCount: null,
+          geneCount: null,
+        })
+      );
       expect(mockAudit.recordUserAuditEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           action: "dataset_version.created",

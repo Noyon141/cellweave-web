@@ -133,3 +133,24 @@ retain legacy role references. The scripts have no repository workflow invocatio
 and must not be reused as current provisioning. Record this technical debt for
 the Phase 3 final exit audit; Step I does not alter historical provisioning or
 applied migrations.
+
+## Dataset-version creation authority
+
+Browser/API callers may create dataset/version setup records and select the existing
+source format. The strict version-creation input accepts only `sourceFormat`;
+checksum and scientific output keys are rejected, including otherwise valid values.
+The application explicitly initializes `sourceChecksum`, `canonicalChecksum`,
+`canonicalFormat`, `organism`, `geneIdScheme`, `referenceBuild`, `cellCount`, and
+`geneCount` to null. Browser input cannot establish scientific truth or preseed the
+SQL finalizer's non-null canonical-checksum replay predicate.
+
+These dataset-version columns are trusted outputs. Source checksum originates in
+trusted persisted provenance and the format-specific import checksum provider,
+then `dataset_imports.source_checksum`. Canonical checksum comes only from the
+verified publication result; scientific facts come from trusted canonicalization.
+The intended production mutation boundary is `finalizePublishedDatasetImport()`
+using the dedicated finalizer connection and `finalize_dataset_version_import()`.
+The SQL function copies the persisted import source checksum and atomically writes
+the finalized fields. Dataset-version routes expose no PATCH/PUT update operation.
+The retained unreferenced legacy `DatasetImportService.finalizeImport()` remains
+technical debt and is not a production caller or an alternative authority path.

@@ -58,22 +58,16 @@ export const createDatasetSchema = z.object({
 
 export type CreateDatasetInput = z.infer<typeof createDatasetSchema>;
 
-export const createDatasetVersionSchema = z.object({
-  sourceFormat: z
-    .string()
-    .trim()
-    .min(1, "Source format is required")
-    .max(50, "Source format cannot exceed 50 characters"),
-  canonicalFormat: z.string().trim().max(50).nullable().optional(),
-  organism: z.string().trim().max(100).nullable().optional(),
-  geneIdScheme: z.string().trim().max(50).nullable().optional(),
-  referenceBuild: z.string().trim().max(50).nullable().optional(),
-  cellCount: z.number().int().nonnegative().nullable().optional(),
-  geneCount: z.number().int().nonnegative().nullable().optional(),
-  // Source checksum is established from persisted provenance by Phase 3, never by browser input.
-  sourceChecksum: z.never().optional(),
-  canonicalChecksum: z.string().trim().max(128).nullable().optional(),
-});
+// Browser setup input only. Scientific truth is written by trusted import finalization.
+export const createDatasetVersionSchema = z
+  .object({
+    sourceFormat: z
+      .string()
+      .trim()
+      .min(1, "Source format is required")
+      .max(50, "Source format cannot exceed 50 characters"),
+  })
+  .strict();
 
 export type CreateDatasetVersionInput = z.infer<typeof createDatasetVersionSchema>;
 
@@ -359,14 +353,14 @@ export class DatasetService {
             datasetId,
             versionNumber: nextVersionNumber,
             sourceFormat: parsed.data.sourceFormat,
-            canonicalFormat: parsed.data.canonicalFormat ?? null,
-            organism: parsed.data.organism ?? null,
-            geneIdScheme: parsed.data.geneIdScheme ?? null,
-            referenceBuild: parsed.data.referenceBuild ?? null,
-            cellCount: parsed.data.cellCount ?? null,
-            geneCount: parsed.data.geneCount ?? null,
+            canonicalFormat: null,
+            organism: null,
+            geneIdScheme: null,
+            referenceBuild: null,
+            cellCount: null,
+            geneCount: null,
             sourceChecksum: null,
-            canonicalChecksum: parsed.data.canonicalChecksum ?? null,
+            canonicalChecksum: null,
             createdAt: now,
           })
           .returning();
